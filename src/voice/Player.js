@@ -84,6 +84,16 @@ export class Player {
     this.connection = connection;
     this.voiceChannelId = voiceChannel.id;
 
+    // Capture the REAL reason the connection failed (permission errors, etc.)
+    // instead of only reporting a generic timeout.
+    this._connectError = null;
+    connection.on('error', (err) => {
+      this._connectError = err;
+      const code = err?.rawError?.code ?? err?.code;
+      const msg = err?.rawError?.message ?? err?.message ?? 'unknown error';
+      console.error(`[voice] connection error (code ${code ?? '?'}):`, msg);
+    });
+
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
         // Could be a region move — wait to see if it reconnects
@@ -101,11 +111,38 @@ export class Player {
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
     } catch {
+      const err = this._connectError;
+      this._connectError = null;
+      const wasDestroyed = this.destroyed || !this.connection;
+
       this.destroy();
+
+      if (err && !wasDestroyed) {
+        throw new Error(this._friendlyConnectError(err, voiceChannel));
+      }
       throw new Error('Could not connect to the voice channel (timed out).');
     }
 
     return connection;
+  }
+
+  _friendlyConnectError(err, voiceChannel) {
+    const code = err?.rawError?.code ?? err?.code;
+    const msg = String(err?.rawError?.message ?? err?.message ?? '');
+
+    if (code === 4004 || code === 4014 || /permission|no permission/i.test(msg)) {
+      return (
+        `I can't join <#${voiceChannel.id}> — I'm missing the **Connect** permission there. ` +
+        'Give the bot `Connect`/`Speak` (or a role with them) for that voice channel, then try again.'
+      );
+    }
+    if (code === 4005 || /not connected/i.test(msg)) {
+      return `Voice session got interrupted — try again in a moment.`;
+    }
+    return (
+      `Could not join <#${voiceChannel.id}> (code ${code ?? '?'}: ${msg.slice(0, 120) || 'unknown error'}). ` +
+      'Check the bot has `Connect`/`Speak` permissions and the channel isn\'t full.'
+    );
   }
 
   destroy() {

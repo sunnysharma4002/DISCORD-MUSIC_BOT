@@ -54,6 +54,14 @@ export default {
       });
     }
 
+    if (voiceChannel.type === 13) {
+      // Stage channels need extra handling (bot must be a speaker) — reject clearly.
+      return interaction.reply({
+        content: '❌ I can\'t play music in a **Stage** channel. Use a normal voice channel.',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
     const me = interaction.guild.members.me;
     const botVoiceId = me?.voice?.channelId;
     if (botVoiceId && botVoiceId !== voiceChannel.id) {
@@ -65,6 +73,7 @@ export default {
 
     const perms = voiceChannel.permissionsFor(me);
     const missing = [];
+    if (!perms?.has('ViewChannel')) missing.push('ViewChannel');
     if (!perms?.has('Connect')) missing.push('Connect');
     if (!perms?.has('Speak')) missing.push('Speak');
     if (missing.length > 0) {
