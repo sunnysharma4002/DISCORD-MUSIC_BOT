@@ -11,9 +11,27 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
 import { spawn } from 'node:child_process';
+import { constants as ytdlpConstants } from 'youtube-dl-exec';
 
-// yt-dlp invocation. Override with YTDLP_CMD (e.g. "yt-dlp" or "python -m yt_dlp").
-const [YTDLP_BIN, ...YTDLP_PREARGS] = (process.env.YTDLP_CMD || 'python -m yt_dlp').split(' ');
+// yt-dlp binary. youtube-dl-exec bundles a per-platform binary (downloaded on
+// npm install), so no system python / yt-dlp is required — works on Railway.
+// Override with YTDLP_CMD (e.g. "yt-dlp" or "python -m yt_dlp") if desired.
+let _ytdlpLogged = false;
+function ytdlpCmd() {
+  const override = (process.env.YTDLP_CMD || '').trim();
+  let bin, pre;
+  if (override) {
+    [bin, ...pre] = override.split(/\s+/);
+  } else {
+    bin = ytdlpConstants.YOUTUBE_DL_PATH; // absolute path to bundled binary
+    pre = [];
+  }
+  if (!_ytdlpLogged) {
+    console.log(`[player] using yt-dlp: ${bin}`);
+    _ytdlpLogged = true;
+  }
+  return { bin, pre };
+}
 
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
 const EMPTY_QUEUE_LEAVE_MS = 120_000; // idle with empty queue → leave
@@ -349,8 +367,9 @@ export class Player {
       }
     }
 
+    const { bin, pre } = ytdlpCmd();
     const args = [
-      ...YTDLP_PREARGS,
+      ...pre,
       '-f', 'bestaudio/best',
       '--no-playlist',
       '--quiet',
@@ -360,7 +379,7 @@ export class Player {
       url,
     ];
 
-    const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stderr = '';
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -393,10 +412,11 @@ export class Player {
 
   /** Best-effort metadata fetch via `yt-dlp -J` (single JSON dump). */
   async _enrichMetadata(track, url) {
+    const { bin, pre } = ytdlpCmd();
     const info = await new Promise((resolve, reject) => {
       const proc = spawn(
-        YTDLP_BIN,
-        [...YTDLP_PREARGS, '-J', '--no-playlist', '--no-warnings', url],
+        bin,
+        [...pre, '-J', '--no-playlist', '--no-warnings', url],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       let out = '';

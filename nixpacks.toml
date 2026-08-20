@@ -1,7 +1,8 @@
 # Railway / Nixpacks build config.
-# Provides the yt-dlp binary + ffmpeg the bot needs at runtime.
+# yt-dlp itself is bundled by the npm package `youtube-dl-exec` (downloaded on
+# install), so only ffmpeg is needed as a system package for transcoding.
 [phases.setup]
-nixPkgs = ["nodejs", "yt-dlp", "ffmpeg"]
+nixPkgs = ["nodejs", "ffmpeg"]
 
 [start]
 cmd = "node index.js"
