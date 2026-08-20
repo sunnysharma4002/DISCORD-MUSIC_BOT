@@ -1,119 +1,139 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { resolveSpotify, resolveYouTube, isSpotifyURL } from '../spotify/resolver.js';
+import { resolveQuery, isSpotifyURL } from '../spotify/resolver.js';
 
 export default {
   data: new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a song from YouTube or Spotify')
-    .addStringOption(opt =>
-      opt.setName('query')
-        .setDescription('YouTube URL, search query, or Spotify link')
+    .setDescription('Play a track from YouTube or Spotify')
+    .addStringOption((opt) =>
+      opt
+        .setName('query')
+        .setDescription('Song name, YouTube link, or Spotify track/album/playlist link')
         .setRequired(true)
+        .setMaxLength(500),
     ),
 
   async execute(interaction) {
-    const query = interaction.options.getString('query');
-    const { user } = interaction;
+    const query = interaction.options.getString('query', true);
 
-    // Defer reply — resolution can take several seconds
+    /* -- Voice channel + permission checks (before deferring) ------ */
+    const voiceChannel = interaction.member?.voice?.channel;
+    if (!voiceChannel) {
+      return interaction.reply({
+        content: '❌ Join a voice channel first.',
+        ephemeral: true,
+      });
+    }
+
+    const me = interaction.guild.members.me;
+    const botVoiceId = me?.voice?.channelId;
+    if (botVoiceId && botVoiceId !== voiceChannel.id) {
+      return interaction.reply({
+        content: `❌ I'm already playing in <#${botVoiceId}>.`,
+        ephemeral: true,
+      });
+    }
+
+    const perms = voiceChannel.permissionsFor(me);
+    const missing = [];
+    if (!perms?.has('Connect')) missing.push('Connect');
+    if (!perms?.has('Speak')) missing.push('Speak');
+    if (missing.length > 0) {
+      return interaction.reply({
+        content: `❌ I need the **${missing.join('** and **')}** permission${missing.length > 1 ? 's' : ''} in <#${voiceChannel.id}>.`,
+        ephemeral: true,
+      });
+    }
+
+    if (voiceChannel.full && !perms.has('MoveMembers')) {
+      return interaction.reply({
+        content: '❌ That voice channel is full.',
+        ephemeral: true,
+      });
+    }
+
+    /* -- Resolve + play -------------------------------------------- */
     await interaction.deferReply();
 
-    const guild = interaction.guild;
-    const member = interaction.member;
+    const player = interaction.client.getPlayer(interaction.guild.id, true);
 
-    // ── Voice channel checks ──────────────────────────────────
-    const voiceChannel = member?.voice?.channel;
-    if (!voiceChannel) {
-      return interaction.editReply({
-        content: '❌ You must be in a voice channel to use this command.'
-      });
-    }
-
-    const botMember = guild.members.me;
-    if (!botMember?.voice?.channel) {
-      // Bot not in voice — will join user's channel
-    } else if (botMember.voice.channelId !== voiceChannel.id) {
-      return interaction.editReply({
-        content: '❌ I\'m already playing in another voice channel.'
-      });
-    }
-
-    const permissions = voiceChannel.permissionsFor(botMember);
-    if (!permissions?.has('Connect') || !permissions?.has('Speak')) {
-      return interaction.editReply({
-        content: '❌ I need **Connect** and **Speak** permissions in your voice channel.'
-      });
-    }
-
-    // ── Get or create player ──────────────────────────────────
-    let player = interaction.client.getPlayer(guild.id, true);
-
-    // Connect to voice (idempotent)
     try {
       await player.connect(voiceChannel, interaction.channel);
     } catch (err) {
-      return interaction.editReply({ content: `❌ Failed to join voice: ${err.message}` });
+      return interaction.editReply(`❌ ${err.message}`);
     }
 
-    // ── Resolve tracks ────────────────────────────────────────
+    let result;
     try {
-      let tracks;
-
-      if (isSpotifyURL(query)) {
-        tracks = await resolveSpotify(query);
-        if (!tracks || tracks.length === 0) {
-          return interaction.editReply({ content: '❌ No playable tracks found in that Spotify link.' });
-        }
-      } else {
-        const ytTrack = await resolveYouTube(query);
-        tracks = [ytTrack];
-      }
-
-      // Attach requester info
-      tracks.forEach(t => { t.requestedBy = user.id; });
-
-      const wasEmpty = player.queue.length === 0 && !player.current;
-      player.addTracks(tracks);
-
-      if (wasEmpty) {
-        // Start playing immediately
-        await player.playTrack(player.queue.shift());
-      }
-
-      // ── Response embed ──────────────────────────────────────
-      const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTimestamp();
-
-      if (tracks.length === 1) {
-        const t = tracks[0];
-        embed.setTitle('🎵 Added to queue')
-          .setDescription(`**${t.title}**`)
-          .addFields(
-            { name: 'Duration', value: t.isLive ? '🔴 LIVE' : formatDuration(t.duration), inline: true },
-            { name: 'Position', value: wasEmpty ? 'Playing now' : `#${player.queue.length}`, inline: true },
-            { name: 'Source', value: t.source === 'spotify-resolved' ? 'Spotify → YouTube' : 'YouTube', inline: true }
-          )
-          .setThumbnail(t.thumbnail);
-      } else {
-        embed.setTitle('📀 Playlist added')
-          .setDescription(`**${tracks.length} tracks** from ${isSpotifyURL(query) ? 'Spotify' : 'YouTube'}`)
-          .addFields({ name: 'First track', value: `**${tracks[0].title}**` });
-      }
-
-      return interaction.editReply({ content: null, embeds: [embed] });
-
+      result = await resolveQuery(query, interaction.user.id);
     } catch (err) {
-      console.error('[play] Error:', err);
-      return interaction.editReply({ content: `❌ Error: ${err.message}` });
+      console.error('[play] resolve failed:', err);
+      // Leave voice again if we joined only for this failed request
+      if (!player.current && player.queue.length === 0) player.destroy();
+      return interaction.editReply(`❌ ${err.message}`);
     }
+
+    const { tracks, playlistName, skipped, truncated } = result;
+    const startedEmpty = !player.current && player.queue.length === 0;
+
+    player.enqueue(tracks);
+
+    try {
+      await player.start();
+    } catch (err) {
+      console.error('[play] start failed:', err);
+      return interaction.editReply(`❌ Failed to start playback: ${err.message}`);
+    }
+
+    /* -- Confirmation embed ---------------------------------------- */
+    const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
+    const embed = new EmbedBuilder().setColor(0x57f287);
+
+    if (tracks.length === 1) {
+      const t = tracks[0];
+      embed
+        .setAuthor({ name: startedEmpty ? 'Playing now' : 'Added to queue' })
+        .setTitle(t.title.slice(0, 250))
+        .setURL(t.url)
+        .addFields(
+          { name: 'Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
+          {
+            name: 'Position',
+            value: startedEmpty ? 'Playing now' : `#${player.queue.length}`,
+            inline: true,
+          },
+          { name: 'Source', value: sourceLabel, inline: true },
+        );
+      if (t.thumbnail) embed.setThumbnail(t.thumbnail);
+    } else {
+      const totalMs = tracks.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
+      embed
+        .setAuthor({ name: 'Added to queue' })
+        .setTitle((playlistName ?? 'Playlist').slice(0, 250))
+        .setDescription(
+          `**${tracks.length}** tracks queued · ${fmt(totalMs)} total\n` +
+          `First up: [${tracks[0].title.slice(0, 80)}](${tracks[0].url})`,
+        )
+        .addFields({ name: 'Source', value: sourceLabel, inline: true });
+      if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
+    }
+
+    const notes = [];
+    if (skipped > 0) notes.push(`${skipped} track${skipped === 1 ? '' : 's'} couldn't be found on YouTube`);
+    if (truncated) notes.push('list truncated to the first 60 tracks');
+    if (notes.length > 0) embed.setFooter({ text: notes.join(' · ') });
+
+    return interaction.editReply({ embeds: [embed] });
   },
 };
 
-function formatDuration(ms) {
-  if (!ms || ms === Infinity) return 'LIVE';
-  const s = Math.floor(ms / 1000);
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}:${String(sec).padStart(2, '0')}`;
+function fmt(ms) {
+  if (!ms || ms <= 0) return '—';
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
 }

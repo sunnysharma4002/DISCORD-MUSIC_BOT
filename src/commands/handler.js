@@ -1,54 +1,56 @@
-import { REST, Routes } from 'discord.js';
+import { REST, Routes, Collection } from 'discord.js';
 import { readdirSync } from 'node:fs';
 import { basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 const commandsDir = fileURLToPath(new URL('./', import.meta.url));
+const EXCLUDED = new Set(['handler']);
 
-/**
- * Auto-discovers command files in this directory, loads them,
- * and registers all slash commands with Discord (guild-scoped).
- */
-export async function registerCommands(client, clientId, guildId) {
-  const commandFiles = readdirSync(commandsDir)
-    .filter(f => f.endsWith('.js') && basename(f, '.js') !== 'handler');
+/** Loads every command module in this folder into client.commands. */
+export async function loadCommands(client) {
+  const files = readdirSync(commandsDir).filter(
+    (f) => f.endsWith('.js') && !EXCLUDED.has(basename(f, '.js')),
+  );
 
-  const commands = [];
-  client.commands = new (await import('discord.js')).Collection();
+  client.commands = new Collection();
+  const payload = [];
 
-  for (const file of commandFiles) {
-    const { default: cmd } = await import(`./${file}`);
-    if (!cmd?.data?.name) {
-      console.warn(`[WARN] Skipping ${file} — no command data.`);
+  for (const file of files) {
+    // pathToFileURL keeps Windows paths valid as ESM specifiers
+    const mod = await import(pathToFileURL(join(commandsDir, file)).href);
+    const cmd = mod.default;
+
+    if (!cmd?.data?.name || typeof cmd.execute !== 'function') {
+      console.warn(`[WARN] ${file} is not a valid command — skipped.`);
       continue;
     }
+
     client.commands.set(cmd.data.name, cmd);
-    commands.push(cmd.data.toJSON());
-    console.log(`[CMD]   Loaded: ${cmd.data.name}`);
+    payload.push(cmd.data.toJSON());
+    console.log(`[CMD]  /${cmd.data.name}`);
+  }
+
+  return payload;
+}
+
+/** Loads commands and registers them with Discord. */
+export async function registerCommands(client, clientId, guildId) {
+  const payload = await loadCommands(client);
+  if (payload.length === 0) {
+    console.warn('[WARN] No commands to register.');
+    return;
   }
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const route = guildId
+    ? Routes.applicationGuildCommands(clientId, guildId)
+    : Routes.applicationCommands(clientId);
 
-  try {
-    console.log(`[INFO]  Registering ${commands.length} slash command(s)...`);
+  await rest.put(route, { body: payload });
 
-    if (guildId) {
-      // Guild-scoped (instant update, good for dev)
-      await rest.put(
-        Routes.applicationGuildCommands(clientId, guildId),
-        { body: commands }
-      );
-    } else {
-      // Global (up to 1h propagation)
-      await rest.put(
-        Routes.applicationCommands(clientId),
-        { body: commands }
-      );
-    }
-
-    console.log('[INFO]  Commands registered successfully.');
-  } catch (err) {
-    console.error('[ERROR] Command registration failed:', err);
-    throw err;
-  }
+  console.log(
+    `[INFO] Registered ${payload.length} command(s) ` +
+    (guildId ? `in guild ${guildId}.` : 'globally (may take up to 1 hour to appear).'),
+  );
 }

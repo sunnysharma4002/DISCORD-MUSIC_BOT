@@ -1,4 +1,5 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { SlashCommandBuilder } from 'discord.js';
+import { requireSameVoice } from '../voice/guards.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -7,19 +8,20 @@ export default {
 
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
-    if (!player || !player.current) {
-      return interaction.reply({ content: '❌ Nothing is playing right now.', ephemeral: true });
+    const guard = requireSameVoice(interaction, player);
+    if (guard) return interaction.reply({ content: guard, ephemeral: true });
+
+    if (!player.current) {
+      return interaction.reply({ content: '❌ Nothing is playing.', ephemeral: true });
     }
 
-    const previous = player.current;
+    const title = player.current.title;
+    const hasNext = player.queue.length > 0 || player.loop !== 'off';
     player.skip();
 
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle('⏭ Skipped')
-      .setDescription(`**${previous.title}**`)
-      .setTimestamp();
-
-    return interaction.reply({ embeds: [embed] });
+    return interaction.reply(
+      `⏭ Skipped **${title.slice(0, 200)}**.` +
+      (hasNext ? '' : ' Queue is now empty.'),
+    );
   },
 };

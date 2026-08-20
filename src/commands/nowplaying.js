@@ -7,11 +7,14 @@ export default {
 
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
+
     if (!player || !player.current) {
-      return interaction.reply({ content: '❌ Nothing is playing right now.', ephemeral: true });
+      return interaction.reply({
+        content: '❌ Nothing is playing right now.',
+        ephemeral: true,
+      });
     }
 
-    const embed = player.nowPlayingEmbed();
-    return interaction.reply({ embeds: [embed] });
+    return interaction.reply({ embeds: [player.nowPlayingEmbed()] });
   },
 };

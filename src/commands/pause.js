@@ -1,4 +1,5 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { SlashCommandBuilder } from 'discord.js';
+import { requireSameVoice } from '../voice/guards.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -7,22 +8,21 @@ export default {
 
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
-    if (!player || !player.current) {
+    const guard = requireSameVoice(interaction, player);
+    if (guard) return interaction.reply({ content: guard, ephemeral: true });
+
+    if (!player.current) {
       return interaction.reply({ content: '❌ Nothing is playing.', ephemeral: true });
     }
 
-    if (player.audioPlayer.paused) {
+    if (player.isPaused) {
       return interaction.reply({ content: '⏸ Already paused.', ephemeral: true });
     }
 
-    player.pause();
+    if (!player.pause()) {
+      return interaction.reply({ content: '❌ Couldn\'t pause playback.', ephemeral: true });
+    }
 
-    const embed = new EmbedBuilder()
-      .setColor(0xFAA61A)
-      .setTitle('⏸ Paused')
-      .setDescription(`**${player.current.title}**`)
-      .setTimestamp();
-
-    return interaction.reply({ embeds: [embed] });
+    return interaction.reply(`⏸ Paused **${player.current.title.slice(0, 200)}**.`);
   },
 };

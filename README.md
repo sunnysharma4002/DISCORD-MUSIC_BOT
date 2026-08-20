@@ -66,7 +66,9 @@ copy .env.example .env
 npm run deploy
 ```
 
-This registers the slash commands in your test guild (instant, not global).
+This registers the slash commands once. If `GUILD_ID` is set in `.env`, commands appear instantly in that server. Without it, global registration takes up to 1 hour.
+
+> **Note:** The bot also auto-registers commands on startup as a fallback.
 
 ### 6. Start the Bot
 
@@ -126,16 +128,15 @@ User runs /play <query>
 ## Project Structure
 
 ```
+index.js                  — Root entry (hosting panels start here)
 src/
-├── index.js              — Entry point, client setup, voice state cleanup
+├── index.js              — Bot client, intents, voice cleanup, interaction dispatch
+├── deploy-commands.js    — One-time slash command registration
 ├── commands/
 │   ├── handler.js        — Auto-discovers and registers slash commands
 │   ├── play.js           — /play command (YouTube + Spotify)
-│   ├── skip.js           — /skip
-│   ├── stop.js           — /stop
-│   ├── pause.js          — /pause
-│   ├── resume.js         — /resume
-│   ├── queue.js          — /queue (paginated)
+│   ├── skip.js / stop.js / pause.js / resume.js
+│   ├── queue.js          — Paginated queue embed
 │   └── nowplaying.js     — /nowplaying
 ├── voice/
 │   └── Player.js         — Per-guild voice connection + queue manager
