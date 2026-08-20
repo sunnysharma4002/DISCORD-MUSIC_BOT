@@ -1,0 +1,7 @@
+# Railway / Nixpacks build config.
+# Provides the yt-dlp binary + ffmpeg the bot needs at runtime.
+[phases.setup]
+nixPkgs = ["nodejs", "yt-dlp", "ffmpeg"]
+
+[start]
+cmd = "node index.js"
