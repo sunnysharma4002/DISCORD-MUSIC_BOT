@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 import { requireSameVoice } from '../voice/guards.js';
 
 export default {
@@ -9,18 +9,18 @@ export default {
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
     const guard = requireSameVoice(interaction, player);
-    if (guard) return interaction.reply({ content: guard, ephemeral: true });
+    if (guard) return interaction.reply({ content: guard, flags: MessageFlags.Ephemeral });
 
     if (!player.current) {
-      return interaction.reply({ content: '❌ Nothing is playing.', ephemeral: true });
+      return interaction.reply({ content: '❌ Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
     if (player.isPaused) {
-      return interaction.reply({ content: '⏸ Already paused.', ephemeral: true });
+      return interaction.reply({ content: '⏸ Already paused.', flags: MessageFlags.Ephemeral });
     }
 
     if (!player.pause()) {
-      return interaction.reply({ content: '❌ Couldn\'t pause playback.', ephemeral: true });
+      return interaction.reply({ content: '❌ Couldn\'t pause playback.', flags: MessageFlags.Ephemeral });
     }
 
     return interaction.reply(`⏸ Paused **${player.current.title.slice(0, 200)}**.`);

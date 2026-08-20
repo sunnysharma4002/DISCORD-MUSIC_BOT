@@ -39,7 +39,6 @@ client.getPlayer = (guildId, create = false) => {
 
 /* Ready --------------------------------------------------------------- */
 client.once('clientReady', onReady);
-client.once('ready', onReady); // fallback for discord.js < 14.19
 
 let readyHandled = false;
 async function onReady() {

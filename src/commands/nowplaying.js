@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -11,7 +11,7 @@ export default {
     if (!player || !player.current) {
       return interaction.reply({
         content: '❌ Nothing is playing right now.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 

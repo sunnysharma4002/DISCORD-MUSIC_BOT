@@ -1,4 +1,4 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import { resolveQuery, isSpotifyURL } from '../spotify/resolver.js';
 
 export default {
@@ -21,7 +21,7 @@ export default {
     if (!query || !query.trim()) {
       return interaction.reply({
         content: '❌ You need to provide a song name or link.\n\n> Tip: if you see this despite typing something, your Discord client is showing a **stale command** — re-run `npm run deploy` (or `/deploy` on the bot) to force an update.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -30,7 +30,7 @@ export default {
     if (!voiceChannel) {
       return interaction.reply({
         content: '❌ Join a voice channel first.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -39,7 +39,7 @@ export default {
     if (botVoiceId && botVoiceId !== voiceChannel.id) {
       return interaction.reply({
         content: `❌ I'm already playing in <#${botVoiceId}>.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -50,14 +50,14 @@ export default {
     if (missing.length > 0) {
       return interaction.reply({
         content: `❌ I need the **${missing.join('** and **')}** permission${missing.length > 1 ? 's' : ''} in <#${voiceChannel.id}>.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (voiceChannel.full && !perms.has('MoveMembers')) {
       return interaction.reply({
         content: '❌ That voice channel is full.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 

@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 import { requireSameVoice } from '../voice/guards.js';
 
 export default {
@@ -9,7 +9,7 @@ export default {
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
     const guard = requireSameVoice(interaction, player);
-    if (guard) return interaction.reply({ content: guard, ephemeral: true });
+    if (guard) return interaction.reply({ content: guard, flags: MessageFlags.Ephemeral });
 
     const cleared = player.queue.length;
     player.stop();

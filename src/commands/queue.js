@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -14,7 +14,7 @@ export default {
     if (!player || (!player.current && player.queue.length === 0)) {
       return interaction.reply({
         content: '📭 The queue is empty. Add something with `/play`.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
