@@ -23,7 +23,7 @@ if (!GUILD_ID) {
 const stub = { commands: new Collection() };
 
 try {
-  await registerCommands(stub, CLIENT_ID, GUILD_ID);
+  await registerCommands(stub, CLIENT_ID, GUILD_ID, { purgeGlobals: true });
   console.log('✅ Deploy complete.');
   process.exit(0);
 } catch (err) {

@@ -18,9 +18,9 @@ export default {
     }
 
     try {
-      await registerCommands(interaction.client, clientId, interaction.guild.id);
+      await registerCommands(interaction.client, clientId, interaction.guild.id, { purgeGlobals: true });
       return interaction.editReply(
-        '✅ Commands re-registered in this server.\n' +
+        '✅ Commands re-registered in this server (stale global commands removed).\n' +
         'They should refresh within a few seconds — if you still see the old behavior, ' +
         'restart your Discord client (**Ctrl/Cmd + R**) to clear the command cache.',
       );

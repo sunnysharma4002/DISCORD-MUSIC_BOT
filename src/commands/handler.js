@@ -51,7 +51,7 @@ export async function clearGlobalCommands(clientId) {
 }
 
 /** Loads commands and registers them with Discord. */
-export async function registerCommands(client, clientId, guildId) {
+export async function registerCommands(client, clientId, guildId, { purgeGlobals = false } = {}) {
   const payload = await loadCommands(client);
   if (payload.length === 0) {
     console.warn('[WARN] No commands to register.');
@@ -63,10 +63,9 @@ export async function registerCommands(client, clientId, guildId) {
     ? Routes.applicationGuildCommands(clientId, guildId)
     : Routes.applicationCommands(clientId);
 
-  if (guildId) {
-    // A legacy global `/play` (option `song`) was shadowing our guild command.
-    // Guild commands take priority, but clients that cached the old global one
-    // keep invoking it. Deleting all global commands removes that conflict.
+  if (guildId && purgeGlobals) {
+    // Only delete stale global commands during an EXPLICIT deploy.
+    // (A legacy global `/play` with option `song` was shadowing ours.)
     await clearGlobalCommands(clientId);
   }
 
