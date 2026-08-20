@@ -1,5 +1,6 @@
 import {
   joinVoiceChannel,
+  getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
   StreamType,
@@ -74,6 +75,15 @@ export class Player {
       return this.connection;
     }
 
+    // @discordjs/voice REUSES a tracked connection for the guild — even a broken
+    // one left in `Disconnected`. That reuse is a common cause of a permanent
+    // "timed out" connect. Force a clean slate before joining.
+    const stale = getVoiceConnection(this.guildId);
+    if (stale && stale !== this.connection) {
+      console.warn('[voice] Found stale tracked connection — destroying it before rejoin.');
+      try { stale.destroy(); } catch {}
+    }
+
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: this.guildId,
@@ -94,7 +104,24 @@ export class Player {
       console.error(`[voice] connection error (code ${code ?? '?'}):`, msg);
     });
 
+    // Log every state transition — tells us WHERE it gets stuck.
+    //   Signalling → Connecting → Ready   = healthy
+    //   stuck in Signalling               = voice server update never arrived (gateway)
+    //   stuck in Connecting               = UDP socket couldn't complete (host blocks UDP)
+    connection.on('stateChange', (oldState, newState) => {
+      if (oldState.status !== newState.status) {
+        console.log(`[voice] state: ${oldState.status} → ${newState.status}`);
+      }
+    });
+
+    // Don't auto-destroy while we're still waiting for the initial Ready state —
+    // a transient disconnect during handshake would otherwise nuke the connect.
+    let connecting = true;
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      if (connecting) {
+        console.warn('[voice] Disconnected during initial connect — waiting for reconnection.');
+        return;
+      }
       try {
         // Could be a region move — wait to see if it reconnects
         await Promise.race([
@@ -109,20 +136,29 @@ export class Player {
     connection.subscribe(this.audioPlayer);
 
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     } catch {
+      const lastState = connection.state.status;
       const err = this._connectError;
       this._connectError = null;
-      const wasDestroyed = this.destroyed || !this.connection;
+      connecting = false;
+
+      console.warn(`[voice] Never reached Ready — last state: ${lastState}`);
 
       this.destroy();
 
-      if (err && !wasDestroyed) {
+      if (err) {
         throw new Error(this._friendlyConnectError(err, voiceChannel));
       }
-      throw new Error('Could not connect to the voice channel (timed out).');
+      throw new Error(
+        lastState === VoiceConnectionStatus.Connecting || lastState === VoiceConnectionStatus.Signalling
+          ? 'Could not connect to the voice channel (stuck while handshaking). This usually means the hosting ' +
+            'provider blocks Discord voice traffic — a normal host (not game hosting) is required for a music bot.'
+          : 'Could not connect to the voice channel (timed out).',
+      );
     }
 
+    connecting = false;
     return connection;
   }
 
