@@ -1,3 +1,5 @@
+process.env.DEBUG = 'discord-voice*';
+
 import { Client, GatewayIntentBits, Collection, ActivityType, MessageFlags } from 'discord.js';
 import { generateDependencyReport } from '@discordjs/voice';
 import { Player } from './voice/Player.js';

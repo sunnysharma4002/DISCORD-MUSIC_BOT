@@ -10,7 +10,10 @@ import {
   entersState,
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
-import ytdl from '@distube/ytdl-core';
+import { spawn } from 'node:child_process';
+
+// yt-dlp invocation. Override with YTDLP_CMD (e.g. "yt-dlp" or "python -m yt_dlp").
+const [YTDLP_BIN, ...YTDLP_PREARGS] = (process.env.YTDLP_CMD || 'python -m yt_dlp').split(' ');
 
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
 const EMPTY_QUEUE_LEAVE_MS = 120_000; // idle with empty queue → leave
@@ -19,10 +22,8 @@ const EMPTY_QUEUE_LEAVE_MS = 120_000; // idle with empty queue → leave
  * Per-guild music player.
  *
  * Audio pipeline:
- *   ytdl-core (opus/webm) ──► createAudioResource(StreamType.WebmOpus)
- *                             └─ no transcoding when webm/opus is available
- *   ytdl-core (other)     ──► createAudioResource(StreamType.Arbitrary)
- *                             └─ prism-media + ffmpeg transcode to opus
+ *   yt-dlp (bestaudio) ──► stdout ──► createAudioResource(StreamType.Arbitrary)
+ *                          └─ prism-media + ffmpeg transcode to opus
  *   AudioPlayer ──► VoiceConnection ──► Discord
  */
 export class Player {
@@ -136,7 +137,7 @@ export class Player {
     connection.subscribe(this.audioPlayer);
 
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 60_000);
     } catch {
       const lastState = connection.state.status;
       const err = this._connectError;
@@ -193,6 +194,7 @@ export class Player {
     this.current = null;
 
     try { this.audioPlayer.stop(true); } catch {}
+    try { this._activeProc?.kill('SIGKILL'); } catch {}
     try { this.connection?.destroy(); } catch {}
 
     this.connection = null;
@@ -331,74 +333,99 @@ export class Player {
   }
 
   /**
-   * Builds an AudioResource for a track.
-   * Prefers a native webm/opus stream (zero transcoding, lowest CPU),
-   * and falls back to arbitrary audio which prism-media transcodes via ffmpeg.
+   * Builds an AudioResource for a track by streaming the best audio via yt-dlp.
+   * yt-dlp writes the raw audio to stdout; @discordjs/voice + ffmpeg transcode
+   * it to opus (StreamType.Arbitrary).
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
 
-    const info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-          ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
-        },
-      },
-    });
-
-    // Fill in metadata we may not have had from search results
-    const details = info.videoDetails;
-    if (details) {
-      track.title = track.title === 'YouTube video' ? details.title : track.title;
-      track.isLive = Boolean(details.isLiveContent && details.isLive);
-      if (!track.duration) track.duration = Number(details.lengthSeconds) * 1000 || 0;
-      if (!track.author) track.author = details.author?.name ?? 'Unknown';
-      if (!track.thumbnail) {
-        track.thumbnail = details.thumbnails?.at(-1)?.url ?? null;
+    // Enrich metadata (title/duration/author) if missing — best-effort, non-fatal.
+    if (!track.duration || !track.author || track.title === 'YouTube video') {
+      try {
+        await this._enrichMetadata(track, url);
+      } catch (err) {
+        console.warn('[player] metadata fetch failed:', err.message);
       }
     }
 
-    const audioFormats = info.formats.filter((f) => f.hasAudio && !f.hasVideo);
-    if (audioFormats.length === 0) {
-      throw new Error('no audio-only stream available');
-    }
+    const args = [
+      ...YTDLP_PREARGS,
+      '-f', 'bestaudio/best',
+      '--no-playlist',
+      '--quiet',
+      '--no-warnings',
+      '-o', '-',              // stream to stdout
+      ...(process.env.YOUTUBE_COOKIE_FILE ? ['--cookies', process.env.YOUTUBE_COOKIE_FILE] : []),
+      url,
+    ];
 
-    // Highest-bitrate webm/opus format avoids a transcode entirely
-    const opusFormat = audioFormats
-      .filter((f) => f.codecs?.includes('opus') && f.container === 'webm')
-      .sort((a, b) => (b.audioBitrate ?? 0) - (a.audioBitrate ?? 0))[0];
+    const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    const format = opusFormat ?? ytdl.chooseFormat(audioFormats, { quality: 'highestaudio' });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
-    const stream = ytdl.downloadFromInfo(info, {
-      format,
-      highWaterMark: 1 << 25,  // 32 MiB read-ahead — smooths network hiccups
-      dlChunkSize: 0,          // single request; avoids chunk-boundary stalls
+    proc.on('error', (err) => {
+      console.error('[player] yt-dlp spawn error:', err.message);
     });
 
-    // Surface stream-level failures on the audio player instead of crashing
+    proc.on('close', (code) => {
+      if (code && code !== 0 && !this.destroyed) {
+        console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
+      }
+    });
+
+    // Kill the child when the audio stream ends/aborts to avoid orphaned processes.
+    const stream = proc.stdout;
     stream.on('error', (err) => {
-      if (err?.message?.includes('aborted')) return; // expected on skip
+      if (err?.message?.includes('aborted') || err?.code === 'EPIPE') return;
       console.error('[player] stream error:', err.message);
     });
+    stream.once('close', () => { try { proc.kill('SIGKILL'); } catch {} });
+    this._activeProc = proc;
 
     return createAudioResource(stream, {
-      inputType: opusFormat ? StreamType.WebmOpus : StreamType.Arbitrary,
+      inputType: StreamType.Arbitrary,
       inlineVolume: false,
       metadata: track,
     });
+  }
+
+  /** Best-effort metadata fetch via `yt-dlp -J` (single JSON dump). */
+  async _enrichMetadata(track, url) {
+    const info = await new Promise((resolve, reject) => {
+      const proc = spawn(
+        YTDLP_BIN,
+        [...YTDLP_PREARGS, '-J', '--no-playlist', '--no-warnings', url],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let out = '';
+      let err = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.stderr.on('data', (d) => { err += d.toString(); });
+      proc.on('error', reject);
+      proc.on('close', (code) => {
+        if (code !== 0) return reject(new Error(err.slice(0, 200) || `yt-dlp exited ${code}`));
+        try { resolve(JSON.parse(out)); } catch (e) { reject(e); }
+      });
+    });
+
+    if (track.title === 'YouTube video' && info.title) track.title = info.title;
+    track.isLive = Boolean(info.is_live);
+    if (!track.duration && info.duration) track.duration = info.duration * 1000;
+    if (!track.author) track.author = info.uploader ?? info.channel ?? 'Unknown';
+    if (!track.thumbnail && info.thumbnail) track.thumbnail = info.thumbnail;
   }
 
   _friendlyError(err) {
     const msg = String(err?.message ?? '');
     if (/private video/i.test(msg)) return 'the video is private.';
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
-    if (/age.?restrict|sign in/i.test(msg)) return 'the video is age-restricted.';
+    if (/age.?restrict|sign in|confirm your age/i.test(msg)) return 'the video is age-restricted.';
     if (/429|rate/i.test(msg)) return 'YouTube is rate-limiting the bot. Try again shortly.';
-    if (/no audio-only/i.test(msg)) return 'no playable audio stream was found.';
+    if (/no.*format|playable/i.test(msg)) return 'no playable audio stream was found.';
     if (/premium|members/i.test(msg)) return 'the video requires a paid membership.';
+    if (/ENOENT/i.test(msg)) return 'yt-dlp is not installed or not on PATH.';
     return msg.slice(0, 150) || 'unknown streaming error.';
   }
 
