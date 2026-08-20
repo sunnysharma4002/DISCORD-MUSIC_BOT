@@ -11,9 +11,10 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 
 // Path to the standalone (python-free) yt-dlp fetched by scripts/setup-ytdlp.mjs.
@@ -44,6 +45,54 @@ function ytdlpCmd() {
     _ytdlpLogged = true;
   }
   return { bin, pre };
+}
+
+// Anti-bot ("Sign in to confirm you're not a bot") mitigation.
+// YouTube blocks datacenter IPs (Railway) unless the request carries cookies
+// and/or uses a mobile client. These args are appended to every yt-dlp call.
+//
+// Cookies (best fix — from a logged-in account) via either:
+//   YOUTUBE_COOKIE_FILE = absolute path to a Netscape cookies.txt
+//   YOUTUBE_COOKIES     = full cookies.txt *contents* (Railway var; written to /tmp)
+// Client spoofing helps even without cookies and is always applied.
+let _cookieFileCache; // undefined = not resolved, null = none, string = path
+function resolveCookieFile() {
+  if (_cookieFileCache !== undefined) return _cookieFileCache;
+
+  if (process.env.YOUTUBE_COOKIE_FILE && existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
+    _cookieFileCache = process.env.YOUTUBE_COOKIE_FILE;
+  } else if (process.env.YOUTUBE_COOKIES) {
+    try {
+      const p = join(tmpdir(), 'yt-cookies.txt');
+      let contents = process.env.YOUTUBE_COOKIES;
+      // Netscape files must start with this header line or yt-dlp rejects them.
+      if (!contents.startsWith('# Netscape') && !contents.startsWith('# HTTP')) {
+        contents = '# Netscape HTTP Cookie File\n' + contents;
+      }
+      writeFileSync(p, contents);
+      _cookieFileCache = p;
+      console.log('[player] wrote YouTube cookies from env to', p);
+    } catch (err) {
+      console.warn('[player] failed to write cookies from env:', err.message);
+      _cookieFileCache = null;
+    }
+  } else {
+    _cookieFileCache = null;
+  }
+  return _cookieFileCache;
+}
+
+/** Shared yt-dlp args to dodge YouTube's bot check. */
+function antiBotArgs() {
+  const args = [
+    // Use the tv/mobile innertube clients — far less likely to hit the bot wall.
+    '--extractor-args', 'youtube:player_client=tv,android,web',
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  ];
+  const cookies = resolveCookieFile();
+  if (cookies) args.push('--cookies', cookies);
+  return args;
 }
 
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
@@ -388,7 +437,7 @@ export class Player {
       '--quiet',
       '--no-warnings',
       '-o', '-',              // stream to stdout
-      ...(process.env.YOUTUBE_COOKIE_FILE ? ['--cookies', process.env.YOUTUBE_COOKIE_FILE] : []),
+      ...antiBotArgs(),
       url,
     ];
 
@@ -429,7 +478,7 @@ export class Player {
     const info = await new Promise((resolve, reject) => {
       const proc = spawn(
         bin,
-        [...pre, '-J', '--no-playlist', '--no-warnings', url],
+        [...pre, '-J', '--no-playlist', '--no-warnings', ...antiBotArgs(), url],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       let out = '';
@@ -454,7 +503,10 @@ export class Player {
     const msg = String(err?.message ?? '');
     if (/private video/i.test(msg)) return 'the video is private.';
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
-    if (/age.?restrict|sign in|confirm your age/i.test(msg)) return 'the video is age-restricted.';
+    if (/age.?restrict|confirm your age/i.test(msg)) return 'the video is age-restricted.';
+    if (/confirm.*not a bot|sign in to confirm/i.test(msg)) {
+      return 'YouTube is blocking the server (bot check). Set the `YOUTUBE_COOKIES` env var with a logged-in cookies.txt — see README.';
+    }
     if (/429|rate/i.test(msg)) return 'YouTube is rate-limiting the bot. Try again shortly.';
     if (/no.*format|playable/i.test(msg)) return 'no playable audio stream was found.';
     if (/premium|members/i.test(msg)) return 'the video requires a paid membership.';
