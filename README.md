@@ -27,12 +27,14 @@ undici             — HTTP client for HLS live streams
 
 ### 1. Prerequisites
 
-- Node.js >= 18.0.0
+- Node.js >= 20.18.1 (Node 22 LTS recommended). **Node 18 will not work** — the dependency stack requires Node 20+.
 - A Discord application with a bot user
 - Bot must have these permissions in your test server:
   - `Connect`, `Speak`, `Use Voice Activity` (voice)
   - `Send Messages`, `Embed Links` (text)
   - `Use Application Commands` (slash commands)
+
+> **Hosting panel:** in Pterodactyl / Bot-Hosting, set the Node.js version in the **Startup** tab to `20` or `22` (Node 18 is EOL). If the bot crashes on boot with `ReferenceError: File is not defined` or `undici` errors, the panel is running Node 18 — change the version there.
 
 ### 2. Create Discord Bot & Get Credentials
 
