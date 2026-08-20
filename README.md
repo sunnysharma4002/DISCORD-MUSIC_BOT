@@ -150,8 +150,12 @@ package.json
 
 | Issue | Solution |
 |-------|----------|
+| `Required option "query" not found` | Stale slash commands — run `npm run deploy` with `GUILD_ID` set in `.env`, then restart your Discord client (or wait ~1 min for the cache to refresh) |
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
-| Commands not appearing | Run `npm run deploy` and check GUILD_ID is correct |
-| YouTube rate limit (HTTP 429) | Add YouTube cookies to `.env` |
-| Spotify tracks not found | play-dl auto-generates Spotify tokens; wait a few seconds between requests |
+| Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
+| YouTube rate limit (HTTP 429) | Add a `YOUTUBE_COOKIE` to `.env` |
+| Spotify tracks not found | The embed scraper is rate-limited; wait a few seconds between requests |
 | Bot leaves immediately | Check `Connect`/`Speak` permissions in the voice channel |
+| No audio (bot joins but silent) | Run the bot once and check the `@discordjs/voice` dependency report at startup — `opusscript` and `libsodium-wrappers` must be present |
+
+> **Global vs guild commands:** If `GUILD_ID` is empty, commands register **globally** and can take up to 1 hour to appear. Set `GUILD_ID` to a test server for instant registration.

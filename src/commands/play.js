@@ -14,7 +14,16 @@ export default {
     ),
 
   async execute(interaction) {
-    const query = interaction.options.getString('query', true);
+    // Defensive: never use required=true here. Stale slash-command caches
+    // (Discord not yet showing the newest definition) can send the interaction
+    // without the option — that used to crash with "Required option not found".
+    const query = interaction.options.getString('query');
+    if (!query || !query.trim()) {
+      return interaction.reply({
+        content: '❌ You need to provide a song name or link.\n\n> Tip: if you see this despite typing something, your Discord client is showing a **stale command** — re-run `npm run deploy` (or `/deploy` on the bot) to force an update.',
+        ephemeral: true,
+      });
+    }
 
     /* -- Voice channel + permission checks (before deferring) ------ */
     const voiceChannel = interaction.member?.voice?.channel;

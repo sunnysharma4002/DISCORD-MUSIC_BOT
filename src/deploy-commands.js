@@ -13,6 +13,12 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   process.exit(1);
 }
 
+if (!GUILD_ID) {
+  console.warn('[WARN] GUILD_ID is not set — commands will be registered GLOBALLY.');
+  console.warn('[WARN] Global commands can take up to 1 HOUR to appear.');
+  console.warn('[WARN] Set GUILD_ID in .env for instant registration in one server.\n');
+}
+
 // registerCommands only needs a `commands` collection to populate
 const stub = { commands: new Collection() };
 

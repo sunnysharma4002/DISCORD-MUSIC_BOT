@@ -83,6 +83,13 @@ client.on('interactionCreate', async (interaction) => {
       content: `❌ Something went wrong: ${String(err?.message ?? 'unknown error').slice(0, 300)}`,
     };
 
+    // Stale command cache → option missing → tell the user how to fix it
+    if (err?.code === 'CommandInteractionOptionNotFound' || /Required option .* not found/.test(String(err?.message ?? ''))) {
+      payload.content =
+        '❌ Stale slash command detected — Discord is using an outdated command definition.\n\n' +
+        '**Fix:** run `npm run deploy` in the host console (sets `GUILD_ID` in `.env` first), then **restart Discord** or wait ~1 minute for the cache to refresh.';
+    }
+
     try {
       if (interaction.deferred) await interaction.editReply(payload);
       else if (interaction.replied) await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
