@@ -1,8 +1,8 @@
 # Railway / Nixpacks build config.
-# yt-dlp itself is bundled by the npm package `youtube-dl-exec` (downloaded on
-# install), so only ffmpeg is needed as a system package for transcoding.
+# yt-dlp binary is bundled by the npm package `youtube-dl-exec`, but that build
+# is a Python zipapp — it needs python3 at runtime. ffmpeg is for transcoding.
 [phases.setup]
-nixPkgs = ["nodejs", "ffmpeg"]
+nixPkgs = ["nodejs", "ffmpeg", "python3"]
 
 [start]
 cmd = "node index.js"
