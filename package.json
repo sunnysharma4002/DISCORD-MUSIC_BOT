@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "deploy": "node src/deploy-commands.js"
+    "deploy": "node src/deploy-commands.js",
+    "postinstall": "node scripts/fix-youtube-sr.mjs"
   },
   "engines": {
     "node": ">=20.18.1"
