@@ -14,10 +14,11 @@ export default {
     ),
 
   async execute(interaction) {
-    // Defensive: never use required=true here. Stale slash-command caches
-    // (Discord not yet showing the newest definition) can send the interaction
-    // without the option — that used to crash with "Required option not found".
-    const query = interaction.options.getString('query');
+    // Accept BOTH option names: our fresh command uses `query`, but a stale
+    // legacy `/play` (option named `song`) may still be cached in clients.
+    const query =
+      interaction.options.getString('query') ??
+      interaction.options.getString('song');
     if (!query || !query.trim()) {
       console.warn('[play] Empty-query interaction received. Raw payload:', JSON.stringify({
         commandId: interaction.commandId,

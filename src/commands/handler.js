@@ -34,6 +34,22 @@ export async function loadCommands(client) {
   return payload;
 }
 
+/** Deletes ALL globally-registered commands for this application. */
+export async function clearGlobalCommands(clientId) {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  try {
+    const existing = await rest.get(Routes.applicationCommands(clientId));
+    if (existing.length > 0) {
+      // Putting an empty array removes every global command.
+      await rest.put(Routes.applicationCommands(clientId), { body: [] });
+      console.log(`[PURGE] Removed ${existing.length} stale global command(s):`);
+      for (const c of existing) console.log(`[PURGE]   - /${c.name}`);
+    }
+  } catch (err) {
+    console.warn('[WARN] Could not clear global commands:', err?.message ?? err);
+  }
+}
+
 /** Loads commands and registers them with Discord. */
 export async function registerCommands(client, clientId, guildId) {
   const payload = await loadCommands(client);
@@ -46,6 +62,13 @@ export async function registerCommands(client, clientId, guildId) {
   const route = guildId
     ? Routes.applicationGuildCommands(clientId, guildId)
     : Routes.applicationCommands(clientId);
+
+  if (guildId) {
+    // A legacy global `/play` (option `song`) was shadowing our guild command.
+    // Guild commands take priority, but clients that cached the old global one
+    // keep invoking it. Deleting all global commands removes that conflict.
+    await clearGlobalCommands(clientId);
+  }
 
   await rest.put(route, { body: payload });
 
