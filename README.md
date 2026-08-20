@@ -72,6 +72,8 @@ This registers the slash commands once. If `GUILD_ID` is set in `.env`, commands
 
 > **Note:** The bot also auto-registers commands on startup as a fallback.
 
+**Stuck with stale commands?** The bot includes a `/deploy` command (server admins only). Once any command is registered, run `/deploy` in your server to force a refresh without touching the console. If the old behavior persists, restart your Discord client (Ctrl/Cmd + R).
+
 ### 6. Start the Bot
 
 ```bash
@@ -152,7 +154,7 @@ package.json
 
 | Issue | Solution |
 |-------|----------|
-| `Required option "query" not found` | Stale slash commands — run `npm run deploy` with `GUILD_ID` set in `.env`, then restart your Discord client (or wait ~1 min for the cache to refresh) |
+| `Required option "query" not found` / "You need to provide a song name or link" | Stale slash commands — set `GUILD_ID` in `.env`, run `npm run deploy`, then run `/deploy` in your server (or restart Discord) |
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
 | YouTube rate limit (HTTP 429) | Add a `YOUTUBE_COOKIE` to `.env` |
