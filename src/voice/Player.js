@@ -11,17 +11,30 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 
-// yt-dlp binary. youtube-dl-exec bundles a per-platform binary (downloaded on
-// npm install), so no system python / yt-dlp is required — works on Railway.
-// Override with YTDLP_CMD (e.g. "yt-dlp" or "python -m yt_dlp") if desired.
+// Path to the standalone (python-free) yt-dlp fetched by scripts/setup-ytdlp.mjs.
+// Project root is two levels up from src/voice/.
+const _projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
+
+// yt-dlp binary resolution order:
+//   1. YTDLP_CMD env override (e.g. "yt-dlp" or "python -m yt_dlp")
+//   2. vendor/yt-dlp — standalone PyInstaller build, no python needed (Railway)
+//   3. youtube-dl-exec bundled zipapp — needs python3, fine on Windows/dev
+// The bundled zipapp fails on Railway (no python3), hence the vendored fallback.
 let _ytdlpLogged = false;
 function ytdlpCmd() {
   const override = (process.env.YTDLP_CMD || '').trim();
   let bin, pre;
   if (override) {
     [bin, ...pre] = override.split(/\s+/);
+  } else if (existsSync(_vendoredYtdlp)) {
+    bin = _vendoredYtdlp;
+    pre = [];
   } else {
     bin = ytdlpConstants.YOUTUBE_DL_PATH; // absolute path to bundled binary
     pre = [];
