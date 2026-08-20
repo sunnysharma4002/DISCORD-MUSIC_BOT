@@ -19,10 +19,29 @@ export default {
     // without the option — that used to crash with "Required option not found".
     const query = interaction.options.getString('query');
     if (!query || !query.trim()) {
-      return interaction.reply({
-        content: '❌ You need to provide a song name or link.\n\n> Tip: if you see this despite typing something, your Discord client is showing a **stale command** — re-run `npm run deploy` (or `/deploy` on the bot) to force an update.',
-        flags: MessageFlags.Ephemeral,
-      });
+      console.warn('[play] Empty-query interaction received. Raw payload:', JSON.stringify({
+        commandId: interaction.commandId,
+        commandName: interaction.commandName,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        options: interaction.options?.data ?? null,
+        resolved: interaction.options?.resolved ?? null,
+        rawOptions: interaction.rawOptions ?? null,
+      }));
+      try {
+        return await interaction.reply({
+          content:
+            '❌ Discord sent this command with an empty `query`.\n\n' +
+            'This is a **client cache** problem — your Discord app is showing an old `/play` that doesn\'t require a query.\n\n' +
+            '**Fix:** fully close and reopen Discord (or press Ctrl/Cmd+R in the desktop app). If you\'re on mobile, force-close and reopen the app.\n\n' +
+            'Still stuck? Run `/deploy` in this server (admins only), then reload Discord.',
+          flags: MessageFlags.Ephemeral,
+        });
+      } catch (err) {
+        // 10062 = another instance already answered this interaction (duplicate process)
+        console.warn('[play] Empty-query reply failed (possibly duplicate instance):', err?.code ?? err?.message);
+        return null;
+      }
     }
 
     /* -- Voice channel + permission checks (before deferring) ------ */

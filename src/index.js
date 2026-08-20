@@ -3,6 +3,8 @@ import { generateDependencyReport } from '@discordjs/voice';
 import { Player } from './voice/Player.js';
 import { registerCommands } from './commands/handler.js';
 import dotenv from 'dotenv';
+import { writeFileSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 dotenv.config();
 
@@ -12,6 +14,43 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   console.error('[FATAL] Missing DISCORD_TOKEN or CLIENT_ID. Set them in .env or your host\'s environment variables.');
   process.exit(1);
 }
+
+/* Single-instance lock ------------------------------------------------ */
+// Prevents two node processes from running the same bot token — the #1 cause
+// of "Unknown interaction" (10062) errors when both answer the same command.
+const LOCK_FILE = join(process.cwd(), '.bot.lock');
+
+function acquireLock() {
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const pid = Number(readFileSync(LOCK_FILE, 'utf8'));
+      if (pid && pid !== process.pid) {
+        try {
+          process.kill(pid, 0); // alive → duplicate instance
+          console.error(`[FATAL] Another bot instance (PID ${pid}) is already running.`);
+          console.error('        Stop the duplicate process (or restart the server) and try again.');
+          process.exit(1);
+        } catch (err) {
+          if (err?.code !== 'ESRCH') {
+            console.error(`[FATAL] Another bot instance (PID ${pid}) appears to be running.`);
+            process.exit(1);
+          }
+          // stale lock (process died) → take over
+          unlinkSync(LOCK_FILE);
+        }
+      }
+    } catch { /* unreadable lock → treat as stale */ }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid));
+}
+
+function releaseLock() {
+  try {
+    if (Number(readFileSync(LOCK_FILE, 'utf8')) === process.pid) unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+acquireLock();
 
 // Print the voice dependency report once — invaluable for diagnosing
 // "connects but no audio" issues (missing opus/sodium/ffmpeg).
@@ -150,6 +189,15 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 client.on('error', (err) => console.error('[CLIENT ERROR]', err));
 client.on('warn', (msg) => console.warn('[CLIENT WARN]', msg));
 
+// Another instance logged in with the same token — this session is now stale.
+// Shut down so we don't fight the newer instance over the same interactions.
+client.on('invalidated', () => {
+  console.error('[FATAL] Gateway session invalidated — another instance logged in with this token.');
+  console.error('        Shutting down to avoid duplicate command handling.');
+  releaseLock();
+  process.exit(0);
+});
+
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason);
 });
@@ -165,6 +213,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
       try { player.destroy(); } catch {}
     }
     client.destroy();
+    releaseLock();
     process.exit(0);
   });
 }

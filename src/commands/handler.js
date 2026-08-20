@@ -53,4 +53,18 @@ export async function registerCommands(client, clientId, guildId) {
     `[INFO] Registered ${payload.length} command(s) ` +
     (guildId ? `in guild ${guildId}.` : 'globally (may take up to 1 hour to appear).'),
   );
+
+  // Fetch back what Discord actually has — verifies required options are live.
+  try {
+    const registered = await rest.get(route);
+    console.log('[VERIFY] Commands now live on Discord:');
+    for (const cmd of registered) {
+      const opts = (cmd.options ?? [])
+        .map((o) => `${o.name}${o.required ? ' (required)' : ''}`)
+        .join(', ') || '(no options)';
+      console.log(`[VERIFY]   /${cmd.name}: ${opts}`);
+    }
+  } catch (err) {
+    console.warn('[WARN] Could not verify registered commands:', err?.message ?? err);
+  }
 }
