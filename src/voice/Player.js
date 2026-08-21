@@ -1055,6 +1055,15 @@ export class Player {
       }
     }
 
+    // Put working proxy first if specified
+    const workingProxy = process.env.YTDLP_WORKING_PROXY?.trim();
+    if (workingProxy && proxies.includes(workingProxy)) {
+      const idx = proxies.indexOf(workingProxy);
+      proxies.splice(idx, 1);
+      proxies.unshift(workingProxy);
+      console.log(`[player] prioritized working proxy: ${workingProxy}`);
+    }
+
     return proxies;
   }
 
