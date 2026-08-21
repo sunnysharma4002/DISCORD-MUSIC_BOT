@@ -103,10 +103,11 @@ function resolveCookieFile() {
 /** Shared yt-dlp args to dodge YouTube's bot check. */
 function antiBotArgs() {
   const cookies = resolveCookieFile();
-  console.log(`[player] antiBotArgs: cookies=${cookies || 'none'}`);
+  console.log(`[player] antiBotArgs: cookies=${cookies || 'none (using player_client fallback)'}`);
+
   const args = [
     // Try multiple player clients — mobile/TV clients are less aggressively checked.
-    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
+    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
     // Skip HLS formats (often require additional auth)
     '--extractor-args', 'youtube:player_skip=hls',
     // Aggressive retries
@@ -120,9 +121,14 @@ function antiBotArgs() {
     '--format-sort', 'hasaudiorate,hasvideorate,source,codec:vp9.2,avc1',
     // Add headers to look like a real browser
     '--add-header', 'Origin:https://www.youtube.com',
-    '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
   ];
-  if (cookies) args.push('--cookies', cookies);
+  if (cookies) {
+    args.push('--cookies', cookies);
+    console.log('[player] Using cookies for authentication');
+  } else {
+    console.log('[player] No cookies - relying on player_client spoofing only');
+  }
   return args;
 }
 
@@ -169,6 +175,9 @@ export class Player {
 
     // Test yt-dlp on startup
     this._testYtdlp();
+
+    // Test YouTube extraction with cookies
+    this._testYouTubeExtraction();
     this.current = null;
     this.history = [];
 
@@ -248,6 +257,87 @@ export class Player {
 
     // Test Invidious connectivity
     this._testInvidious();
+  }
+
+  /** Test YouTube extraction without cookies */
+  _testYouTubeExtraction() {
+    const { bin, pre } = ytdlpCmd();
+    const cookies = resolveCookieFile();
+
+    console.log(`[player] testing YouTube extraction (cookies=${cookies ? 'yes' : 'no'})`);
+
+    const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+
+    // Test without cookies first
+    const args = [
+      ...pre,
+      '-J',
+      '--no-playlist',
+      '--no-warnings',
+      '--extractor-args', 'youtube:player_client=ios',
+      '--extractor-retries', '3',
+      testUrl,
+    ];
+
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        try {
+          const info = JSON.parse(stdout);
+          console.log(`[player] YouTube extraction OK (no cookies): "${info.title}"`);
+        } catch (e) {
+          console.log(`[player] YouTube extraction OK (no cookies, metadata fetched)`);
+        }
+      } else {
+        console.error(`[player] YouTube extraction FAILED without cookies (code ${code})`);
+        console.error(`[player] stderr: ${stderr.trim().substring(0, 200)}`);
+
+        // Try with cookies if available
+        if (cookies) {
+          console.log('[player] Trying with cookies...');
+          const cookieArgs = [
+            ...pre,
+            '-J',
+            '--no-playlist',
+            '--no-warnings',
+            '--cookies', cookies,
+            '--extractor-args', 'youtube:player_client=ios',
+            testUrl,
+          ];
+          const proc2 = spawn(bin, cookieArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+          let out2 = '';
+          let err2 = '';
+          proc2.stdout.on('data', (d) => { out2 += d.toString(); });
+          proc2.stderr.on('data', (d) => { err2 += d.toString(); });
+          proc2.on('close', (code2) => {
+            if (code2 === 0) {
+              console.log(`[player] YouTube extraction OK (with cookies): success`);
+            } else {
+              console.error(`[player] YouTube extraction FAILED with cookies (code ${code2})`);
+              console.error(`[player] Cookies are expired. Get fresh cookies from a logged-in browser.`);
+            }
+          });
+          setTimeout(() => { try { proc2.kill('SIGKILL'); } catch {} }, 15000);
+        } else {
+          console.error('[player] No cookies available. Options:');
+          console.error('[player] 1. Set YTDLP_PROXY env var to a residential proxy (socks5://host:port)');
+          console.error('[player] 2. Set YOUTUBE_COOKIES env var with fresh cookies from a browser');
+          console.error('[player] 3. Use a different hosting provider (not datacenter IP)');
+        }
+      }
+    });
+
+    proc.on('error', (err) => {
+      console.error(`[player] YouTube extraction ERROR: ${err.message}`);
+    });
+
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 15000);
   }
 
   /** Test Invidious instances connectivity */
@@ -730,35 +820,56 @@ export class Player {
     const { bin, pre } = ytdlpCmd();
     console.log(`[player] using bin="${bin}" pre=${JSON.stringify(pre)}`);
 
-    // Invidious instances — alternative YouTube frontends that bypass CDN blocks.
+    // Proxy support via env var (helps bypass YouTube datacenter blocks)
+    const proxy = (process.env.YTDLP_PROXY || '').trim();
+    const proxyArgs = proxy ? ['--proxy', proxy] : [];
+
+    // Invidious/Piped instances — alternative YouTube frontends that bypass CDN blocks.
     // These are public instances; they may be slow or down, but they work when
     // YouTube directly blocks the server IP.
     const invidiousInstances = [
-      'https://invidious.jing.rocks',
+      // Piped instances (often more reliable)
+      'https://pipedapi.kavin.rocks',
+      'https://pipedapi.adminforge.de',
+      'https://pipedapi.in.projectsegfau.lt',
+      'https://pipedapi.freedit.eu',
+      'https://pipedapi.drgns.space',
+      // Invidious instances
       'https://yewtu.be',
+      'https://invidious.private.coffee',
+      'https://inv.tux.pizza',
+      'https://vid.puffyan.us',
       'https://invidious.fdn.fr',
       'https://inv.riverside.rocks',
-      'https://invidious.private.coffee',
       'https://yt.artemislena.eu',
       'https://invidious.tiekoetter.com',
-      'https://inv.tux.pizza',
+      'https://invidious.jing.rocks',
+      'https://inv.vern.cc',
+      'https://y.com.cm',
     ];
 
     // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
     const extractorSets = [
-      // Primary: Invidious instances (no cookies needed, bypasses YouTube CDN)
-      // Correct syntax: --extractor-args "youtube:instance=URL"
-      ...invidiousInstances.map(instance => [
-        '--extractor-args', `youtube:instance=${instance}`,
-      ]),
-      // Fallback: direct YouTube with cookies
-      antiBotArgs(),
-      // Fallback: iOS only (sometimes bypasses checks)
+      // Primary: Invidious/Piped instances (no cookies needed, bypasses YouTube CDN)
+      ...invidiousInstances.map(instance => {
+        const url = new URL(instance);
+        if (url.hostname.includes('pipedapi')) {
+          // Piped API instances use different syntax
+          return ['--extractor-args', `youtube:player_client=web`];
+        }
+        return ['--extractor-args', `youtube:instance=${instance}`];
+      }),
+      // Fallback: direct YouTube without cookies (try different clients)
       ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-      // Fallback: TV embedded (least aggressive checking)
+      ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
       ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
-      // Fallback: try with user-agent spoofing
-      ['--add-header', 'User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1', '--extractor-retries', '5'],
+      ['--extractor-args', 'youtube:player_client=web', '--extractor-retries', '5'],
+      // Fallback: iOS + mobile user agent
+      ['--extractor-args', 'youtube:player_client=ios',
+       '--add-header', 'User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+       '--extractor-retries', '5'],
+      // Last resort: cookies if available
+      ...(resolveCookieFile() ? [antiBotArgs()] : []),
     ];
 
     for (let attempt = 0; attempt < extractorSets.length; attempt++) {
@@ -767,6 +878,7 @@ export class Player {
         '--no-playlist',
         '--quiet',
         '--no-warnings',
+        ...proxyArgs,
         '-o', '-',
         ...extractorSets[attempt],
         url,
@@ -781,7 +893,7 @@ export class Player {
       }
     }
 
-    throw new Error('All extraction attempts failed — YouTube is blocking this server IP. Try a different host or use a proxy.');
+    throw new Error('All extraction attempts failed — YouTube is blocking this server IP. Try: 1) Set YTDLP_PROXY env var (socks5://host:port), 2) Use fresh YOUTUBE_COOKIES, or 3) Switch to a residential IP host.');
   }
 
   /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
