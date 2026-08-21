@@ -98,6 +98,13 @@ function antiBotArgs() {
     '--retry-sleep', 'extractor:3',
     // Fake referer to look like embedded player
     '--referer', 'https://www.youtube.com/',
+    // Skip certificate verification (helps with some proxy setups)
+    '--no-check-certificate',
+    // Prefer formats that work better with datacenter IPs
+    '--format-sort', 'hasaudiorate,hasvideorate,source,codec:vp9.2,avc1',
+    // Add headers to look like a real browser
+    '--add-header', 'Origin:https://www.youtube.com',
+    '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   ];
   if (cookies) args.push('--cookies', cookies);
   return args;
@@ -528,8 +535,29 @@ export class Player {
 
     const { bin, pre } = ytdlpCmd();
 
+    // Invidious instances — alternative YouTube frontends that bypass CDN blocks.
+    // These are public instances; they may be slow or down, but they work when
+    // YouTube directly blocks the server IP.
+    const invidiousInstances = [
+      'https://invidious.jing.rocks',
+      'https://yewtu.be',
+      'https://invidious.fdn.fr',
+      'https://inv.riverside.rocks',
+      'https://invidious.private.coffee',
+      'https://yt.artemislena.eu',
+      'https://invidious.tiekoetter.com',
+      'https://inv.tux.pizza',
+    ];
+
     // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
     const extractorSets = [
+      // Primary: Invidious instances (no cookies needed, bypasses YouTube CDN)
+      ...invidiousInstances.map(instance => [
+        '--extractor-args', `youtube:player_client=web`,
+        '--extractor-args', `youtube:instance=${instance}`,
+        '--no-check-certificates',
+      ]),
+      // Fallback: direct YouTube with cookies
       antiBotArgs(),
       // Fallback: iOS only (sometimes bypasses checks)
       ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
@@ -552,12 +580,12 @@ export class Player {
 
       if (attempt < extractorSets.length - 1) {
         console.warn(`[player] attempt ${attempt + 1} failed, retrying with different client...`);
-        // Brief pause before retry
-        await new Promise(r => setTimeout(r, 2000));
+        // Longer pause for Invidious retries
+        await new Promise(r => setTimeout(r, attempt >= 3 ? 4000 : 2000));
       }
     }
 
-    throw new Error('All extraction attempts failed — YouTube may be blocking this server. Set YOUTUBE_COOKIES env var for reliable playback.');
+    throw new Error('All extraction attempts failed — YouTube is blocking this server IP. Try a different host or use a proxy.');
   }
 
   /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
@@ -598,13 +626,13 @@ export class Player {
         resolve(null);
       });
 
-      // Timeout after 30s — if no data by then, kill and retry
+      // Timeout after 45s — Invidious can be slower than direct YouTube
       setTimeout(() => {
         if (!gotData) {
           try { proc.kill('SIGKILL'); } catch {}
           resolve(null);
         }
-      }, 30000);
+      }, 45000);
     });
   }
 
