@@ -299,29 +299,35 @@ export class Player {
         console.error(`[player] ✗ YouTube extraction FAILED (direct, code ${code})`);
         console.error(`[player] stderr: ${stderr.trim().substring(0, 300)}`);
 
-        if (stderr.includes('Sign in to confirm')) {
-          console.log('[player] YouTube requires authentication. Testing proxies...');
+        if (stderr.includes('Sign in to confirm') && proxies.length > 0) {
+          console.log('[player] YouTube requires authentication. Testing first 3 proxies...');
 
-          // Test each proxy
-          for (const proxy of proxies.slice(0, 3)) { // Test first 3 proxies
+          // Test first 3 proxies quickly
+          let tested = 0;
+          for (const proxy of proxies.slice(0, 3)) {
             console.log(`[player] Testing proxy: ${proxy}`);
-            const proxyArgs = [...pre, '-J', '--no-playlist', '--no-warnings', '--proxy', proxy, testUrl];
+            const proxyArgs = [...pre, '-J', '--no-playlist', '--no-warnings', '--proxy', proxy, '--extractor-args', 'youtube:player_client=ios', testUrl];
             const proc2 = spawn(bin, proxyArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
             let out2 = '';
             let err2 = '';
             proc2.stdout.on('data', (d) => { out2 += d.toString(); });
             proc2.stderr.on('data', (d) => { err2 += d.toString(); });
             proc2.on('close', (code2) => {
+              tested++;
               if (code2 === 0) {
                 console.log(`[player] ✓ Proxy ${proxy} WORKS!`);
               } else {
                 console.error(`[player] ✗ Proxy ${proxy} FAILED (code ${code2})`);
               }
+              if (tested >= 3) {
+                console.error('[player] SOLUTION: Set YTDLP_PROXIES env var with working proxies');
+                console.error('[player] Format: host:port:username:password,host2:port2:username2:password2');
+              }
             });
-            setTimeout(() => { try { proc2.kill('SIGKILL'); } catch {} }, 10000);
+            setTimeout(() => { try { proc2.kill('SIGKILL'); } catch {} }, 8000);
           }
-
-          console.error('[player] SOLUTION: Set YTDLP_PROXIES env var with working proxies');
+        } else if (proxies.length === 0) {
+          console.error('[player] No proxies configured. Set YTDLP_PROXIES env var.');
           console.error('[player] Format: host:port:username:password,host2:port2:username2:password2');
         }
       }
@@ -866,17 +872,18 @@ export class Player {
       ...(resolveCookieFile() ? [antiBotArgs()] : []),
     ];
 
-    // Build all combinations: proxy x extractor x format
+    // Build all combinations: try direct first, then with each proxy
     const allAttempts = [];
 
-    // First try without proxy
+    // First try direct (no proxy) with all extractor sets
     allAttempts.push({ proxy: null, extractorSets, formatSelectors: ['bestaudio/best', 'bestaudio[ext!=webm]/bestaudio'] });
 
-    // Then try with each proxy
+    // Then try with each proxy - but only use direct YouTube extractors (skip Invidious)
+    const directExtractors = extractorSets.slice(invidiousInstances.length); // Skip Invidious instances
     for (const proxy of proxies) {
       allAttempts.push({
         proxy,
-        extractorSets: extractorSets.slice(0, 3), // Only first 3 extractors to save time
+        extractorSets: directExtractors.slice(0, 5), // Use first 5 direct extractors
         formatSelectors: ['bestaudio/best'],
       });
     }
