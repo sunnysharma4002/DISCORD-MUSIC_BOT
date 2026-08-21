@@ -835,55 +835,68 @@ export class Player {
       'https://invidious.tiekoetter.com',
     ];
 
-    // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
-    const extractorSets = [
-      // Primary: Invidious/Piped instances (no cookies needed, bypasses YouTube CDN)
-      ...invidiousInstances.map(instance => {
-        const url = new URL(instance);
-        if (url.hostname.includes('pipedapi')) {
-          // Piped API instances use different syntax
-          return ['--extractor-args', `youtube:player_client=web`];
-        }
-        return ['--extractor-args', `youtube:instance=${instance}`];
-      }),
-      // Fallback: direct YouTube without cookies (try different clients)
-      ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-      ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
-      ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
-      ['--extractor-args', 'youtube:player_client=web', '--extractor-retries', '5'],
-      // Fallback: iOS + mobile user agent
-      ['--extractor-args', 'youtube:player_client=ios',
-       '--add-header', 'User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-       '--extractor-retries', '5'],
-      // Last resort: cookies if available
-      ...(resolveCookieFile() ? [antiBotArgs()] : []),
-    ];
-
-    // Build all combinations: try direct first (quick), then with each proxy
+    // Build extraction order: third-party first (no proxy needed), then YouTube direct
     const allAttempts = [];
 
-    // Quick direct attempt - only try direct YouTube extractors (skip Invidious, they're all down)
-    const directExtractors = extractorSets.slice(invidiousInstances.length); // Skip Invidious instances
+    // PHASE 1: Third-party (Invidious/Piped) — bypass YouTube CDN, no proxy needed
+    const thirdPartyExtractors = invidiousInstances.map(instance => {
+      const url = new URL(instance);
+      if (url.hostname.includes('pipedapi')) {
+        return ['--extractor-args', `youtube:player_client=web`];
+      }
+      return ['--extractor-args', `youtube:instance=${instance}`];
+    });
     allAttempts.push({
+      phase: 'third-party',
       proxy: null,
-      extractorSets: directExtractors.slice(0, 3), // Only first 3 direct extractors
+      extractorSets: thirdPartyExtractors,
       formatSelectors: ['bestaudio/best'],
     });
 
-    // Then try with each proxy
+    // PHASE 2: Direct YouTube with cookies — bypass bot check with auth
+    const hasCookies = !!resolveCookieFile();
+    if (hasCookies) {
+      allAttempts.push({
+        phase: 'youtube-cookies',
+        proxy: null,
+        extractorSets: [
+          antiBotArgs(),
+        ],
+        formatSelectors: ['bestaudio/best'],
+      });
+    }
+
+    // PHASE 3: Direct YouTube without cookies — try different clients
+    const fallbackExtractors = [
+      ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
+      ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
+      ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
+    ];
+    allAttempts.push({
+      phase: 'youtube-no-cookies',
+      proxy: null,
+      extractorSets: fallbackExtractors,
+      formatSelectors: ['bestaudio/best'],
+    });
+
+    // PHASE 4: Each proxy with direct YouTube extractors
     for (const proxy of proxies) {
       allAttempts.push({
+        phase: 'proxy',
         proxy,
-        extractorSets: directExtractors.slice(0, 3), // Use first 3 direct extractors
+        extractorSets: [
+          ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
+          ['--extractor-args', 'youtube:player_client=web', '--extractor-retries', '5'],
+        ],
         formatSelectors: ['bestaudio/best'],
       });
     }
 
     for (let attemptIdx = 0; attemptIdx < allAttempts.length; attemptIdx++) {
-      const { proxy, extractorSets: sets, formatSelectors } = allAttempts[attemptIdx];
+      const { phase, proxy, extractorSets: sets, formatSelectors } = allAttempts[attemptIdx];
       const proxyArgs = proxy ? ['--proxy', proxy] : [];
 
-      console.log(`[player] === Starting attempt ${attemptIdx+1}/${allAttempts.length} (proxy=${proxy ? proxy.substring(0, 50) + '...' : 'direct'}) ===`);
+      console.log(`[player] === Phase ${attemptIdx+1}/${allAttempts.length}: ${phase}${proxy ? ' (proxy=' + proxy.substring(0, 40) + '...)' : ''} ===`);
 
       for (let setIdx = 0; setIdx < sets.length; setIdx++) {
         for (const format of formatSelectors) {
@@ -897,11 +910,11 @@ export class Player {
             ...sets[setIdx],
             url,
           ];
-          console.log(`[player] trying format=${format} extractor=${sets[setIdx][0]}...`);
+          console.log(`[player] trying format=${format} extractor=${JSON.stringify(sets[setIdx]).substring(0, 60)}...`);
           const result = await this._trySpawnStream(bin, pre, track, url, args);
 
           if (result) {
-            console.log(`[player] SUCCESS with attempt ${attemptIdx+1}!`);
+            console.log(`[player] SUCCESS in phase: ${phase}!`);
             return result;
           }
         }
@@ -911,7 +924,7 @@ export class Player {
         }
       }
 
-      console.log(`[player] attempt ${attemptIdx+1} failed, moving to next...`);
+      console.log(`[player] phase ${phase} failed, moving to next...`);
     }
 
     throw new Error('All extraction attempts failed. Try: 1) Add fresh proxies to YTDLP_PROXIES env var, 2) Use fresh YOUTUBE_COOKIES, or 3) Switch hosting provider.');
