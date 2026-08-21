@@ -894,7 +894,7 @@ export class Player {
 
       for (let setIdx = 0; setIdx < sets.length; setIdx++) {
         for (const format of formatSelectors) {
-          const result = await this._trySpawnStream(bin, pre, track, url, [
+          const args = [
             '-f', format,
             '--no-playlist',
             '--quiet',
@@ -903,7 +903,9 @@ export class Player {
             '-o', '-',
             ...sets[setIdx],
             url,
-          ]);
+          ];
+          console.log(`[player] attempt ${attemptIdx+1}/${allAttempts.length} (proxy=${proxy || 'direct'}, format=${format})`);
+          const result = await this._trySpawnStream(bin, pre, track, url, args);
 
           if (result) return result;
         }
