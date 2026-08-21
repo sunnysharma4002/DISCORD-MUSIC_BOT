@@ -23,16 +23,14 @@ const outDir = join(root, 'vendor');
 const outFile = join(outDir, 'yt-dlp');
 const URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 
-if (existsSync(outFile) && statSync(outFile).size > 1_000_000) {
-  console.log('[setup-ytdlp] standalone yt-dlp already present — skipping.');
-  process.exit(0);
-}
-
 mkdirSync(outDir, { recursive: true });
+
+// Always download latest — YouTube changes frequently and stale yt-dlp breaks.
+console.log('[setup-ytdlp] downloading latest yt-dlp...');
 
 function download(url, redirects = 0) {
   if (redirects > 5) {
-    console.warn('[setup-ytdlp] too many redirects — skipping (bot may fail to stream).');
+    console.warn('[setup-ytdlp] too many redirects — skipping.');
     process.exit(0);
   }
   get(url, { headers: { 'User-Agent': 'discord-music-bot' } }, (res) => {
@@ -50,7 +48,8 @@ function download(url, redirects = 0) {
     file.on('finish', () => file.close(() => {
       try {
         chmodSync(outFile, 0o755);
-        console.log(`[setup-ytdlp] standalone yt-dlp installed: ${outFile}`);
+        const size = statSync(outFile).size;
+        console.log(`[setup-ytdlp] yt-dlp installed: ${outFile} (${(size/1024/1024).toFixed(1)}MB)`);
       } catch (err) {
         console.warn('[setup-ytdlp] chmod failed:', err.message);
       }

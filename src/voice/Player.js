@@ -86,10 +86,15 @@ function resolveCookieFile() {
 /** Shared yt-dlp args to dodge YouTube's bot check. */
 function antiBotArgs() {
   const args = [
-    // Use the tv/mobile innertube clients — far less likely to hit the bot wall.
-    '--extractor-args', 'youtube:player_client=tv,android,web',
-    '--user-agent',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    // Try multiple player clients — mobile/TV clients are less aggressively checked.
+    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
+    // Skip HLS formats (often require additional auth)
+    '--extractor-args', 'youtube:player_skip=hls',
+    // Aggressive retries
+    '--extractor-retries', '5',
+    '--retry-sleep', 'extractor:3',
+    // Fake referer to look like embedded player
+    '--referer', 'https://www.youtube.com/',
   ];
   const cookies = resolveCookieFile();
   if (cookies) args.push('--cookies', cookies);
@@ -493,6 +498,8 @@ export class Player {
    * Builds an AudioResource for a track by streaming the best audio via yt-dlp.
    * yt-dlp writes the raw audio to stdout; @discordjs/voice + ffmpeg transcode
    * it to opus (StreamType.Arbitrary).
+   *
+   * Retries with fallback player clients if YouTube returns a bot check.
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
@@ -507,45 +514,84 @@ export class Player {
     }
 
     const { bin, pre } = ytdlpCmd();
-    const args = [
-      ...pre,
-      '-f', 'bestaudio/best',
-      '--no-playlist',
-      '--quiet',
-      '--no-warnings',
-      '-o', '-',              // stream to stdout
-      ...antiBotArgs(),
-      url,
+
+    // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
+    const extractorSets = [
+      antiBotArgs(),
+      // Fallback: iOS only (sometimes bypasses checks)
+      ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
+      // Fallback: TV embedded (least aggressive checking)
+      ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
     ];
 
-    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    for (let attempt = 0; attempt < extractorSets.length; attempt++) {
+      const result = await this._trySpawnStream(bin, pre, track, url, [
+        '-f', 'bestaudio/best',
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        '-o', '-',
+        ...extractorSets[attempt],
+        url,
+      ]);
 
-    let stderr = '';
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      if (result) return result;
 
-    proc.on('error', (err) => {
-      console.error('[player] yt-dlp spawn error:', err.message);
-    });
-
-    proc.on('close', (code) => {
-      if (code && code !== 0 && !this.destroyed) {
-        console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
+      if (attempt < extractorSets.length - 1) {
+        console.warn(`[player] attempt ${attempt + 1} failed, retrying with different client...`);
+        // Brief pause before retry
+        await new Promise(r => setTimeout(r, 2000));
       }
-    });
+    }
 
-    // Kill the child when the audio stream ends/aborts to avoid orphaned processes.
-    const stream = proc.stdout;
-    stream.on('error', (err) => {
-      if (err?.message?.includes('aborted') || err?.code === 'EPIPE') return;
-      console.error('[player] stream error:', err.message);
-    });
-    stream.once('close', () => { try { proc.kill('SIGKILL'); } catch {} });
-    this._activeProc = proc;
+    throw new Error('All extraction attempts failed — YouTube may be blocking this server. Set YOUTUBE_COOKIES env var for reliable playback.');
+  }
 
-    return createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
-      inlineVolume: false,
-      metadata: track,
+  /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
+  async _trySpawnStream(bin, pre, track, url, args) {
+    return new Promise((resolve) => {
+      const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      let stderr = '';
+      let gotData = false;
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      proc.stdout.on('data', () => { gotData = true; });
+
+      proc.on('error', () => resolve(null));
+
+      proc.on('close', (code) => {
+        // If we got audio data, it's working — return the resource
+        if (gotData && code === 0) {
+          const stream = proc.stdout;
+          stream.on('error', (err) => {
+            if (err?.message?.includes('aborted') || err?.code === 'EPIPE') return;
+            console.error('[player] stream error:', err.message);
+          });
+          stream.once('close', () => { try { proc.kill('SIGKILL'); } catch {} });
+          this._activeProc = proc;
+          resolve(createAudioResource(stream, {
+            inputType: StreamType.Arbitrary,
+            inlineVolume: false,
+            metadata: track,
+          }));
+          return;
+        }
+
+        // Check if it's a bot check error
+        const isBotCheck = /sign in to confirm|confirm you.re not a bot|age-restricted/i.test(stderr);
+        if (!isBotCheck && code !== 0) {
+          console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
+        }
+        resolve(null);
+      });
+
+      // Timeout after 30s — if no data by then, kill and retry
+      setTimeout(() => {
+        if (!gotData) {
+          try { proc.kill('SIGKILL'); } catch {}
+          resolve(null);
+        }
+      }, 30000);
     });
   }
 
