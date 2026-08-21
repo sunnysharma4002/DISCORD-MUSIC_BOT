@@ -16,8 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
-import { get, request as httpsRequest } from 'node:https';
-import { request as httpRequest } from 'node:http';
+import { get } from 'node:https';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 
@@ -271,9 +270,6 @@ export class Player {
     setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
     }, 5000);
-
-    // Test Invidious connectivity
-    this._testInvidious();
   }
 
   /** Test YouTube extraction without cookies */
@@ -355,44 +351,6 @@ export class Player {
     });
 
     setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 15000);
-  }
-
-  /** Test Invidious instances connectivity */
-  _testInvidious() {
-    const invidiousInstances = [
-      'https://inv.nadeko.net',
-      'https://invidious.nerdvpn.de',
-      'https://invidious.f5.si',
-      'https://yt.chocolatemoo53.com',
-      'https://invidious.tiekoetter.com',
-    ];
-
-    console.log('[player] testing Invidious instances...');
-    for (const instance of invidiousInstances) {
-      const url = new URL(instance);
-      const req = get({
-        hostname: url.hostname,
-        path: '/api/v1/videos/dQw4w9WgXcQ',
-        headers: { 'User-Agent': 'discord-music-bot' },
-      }, (res) => {
-        let data = '';
-        res.on('data', (chunk) => { data += chunk; });
-        res.on('end', () => {
-          if (res.statusCode === 200 && data.length > 0) {
-            console.log(`[player] Invidious OK: ${instance} (${res.statusCode})`);
-          } else {
-            console.warn(`[player] Invidious FAIL: ${instance} (${res.statusCode})`);
-          }
-        });
-      });
-      req.on('error', (err) => {
-        console.warn(`[player] Invidious ERROR: ${instance} - ${err.message}`);
-      });
-      req.setTimeout(5000, () => {
-        console.warn(`[player] Invidious TIMEOUT: ${instance}`);
-        req.destroy();
-      });
-    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -811,97 +769,6 @@ export class Player {
   }
 
   /**
-   * Try SaveFrom.net worker API to get a direct audio download URL.
-   * Returns a ReadableStream of audio data or null on failure.
-   */
-  _trySaveFrom(videoUrl) {
-    return new Promise((resolve) => {
-      const ts = Date.now();
-      const params = new URLSearchParams();
-      params.append('_ts', String(ts));
-      params.append('_tsc', '0');
-      params.append('_x', '1');
-      params.append('app', '');
-      params.append('browser', 'Chrome');
-      params.append('channel', 'article');
-      params.append('country', 'in');
-      params.append('lang', 'en');
-      params.append('new', '2');
-      params.append('os', 'Windows');
-      params.append('sf-nomad', '1');
-      params.append('sf_submit', '');
-      params.append('sf_url', videoUrl);
-      params.append('ts', String(ts + 87000));
-
-      const body = params.toString();
-      const options = {
-        hostname: 'worker.savefrom.net',
-        path: '/savefrom.php',
-        method: 'POST',
-        timeout: 20000,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Content-Length': Buffer.byteLength(body),
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Origin': 'https://en.savefrom.net',
-          'Referer': 'https://en.savefrom.net/',
-        },
-      };
-
-      const req = httpsRequest(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try {
-            console.log(`[player] SaveFrom response: status=${res.statusCode} len=${data.length}`);
-            // SaveFrom returns HTML or JSON with the download URL
-            // Look for audio URL in the response
-            const audioMatch = data.match(/"url"\s*:\s*"(https?:\/\/[^"]+audio[^"]+)"/i)
-              || data.match(/"url"\s*:\s*"(https?:\/\/[^"]+)"/i)
-              || data.match(/href="(https?:\/\/[^"]*\.(?:mp3|m4a|ogg|opus|wav|webm)[^"]*)"/i);
-            if (audioMatch) {
-              const audioUrl = audioMatch[1];
-              console.log(`[player] SaveFrom found URL: ${audioUrl.substring(0, 80)}...`);
-              // Fetch the audio stream
-              const audioReq = get(audioUrl, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (audioRes) => {
-                if (audioRes.statusCode >= 300 && audioRes.statusCode < 400 && audioRes.headers.location) {
-                  // Follow redirect
-                  const redirectReq = get(audioRes.headers.location, { timeout: 20000 }, (redirRes) => {
-                    resolve(redirRes);
-                  });
-                  redirectReq.on('error', () => resolve(null));
-                  redirectReq.on('timeout', () => { redirectReq.destroy(); resolve(null); });
-                } else {
-                  resolve(audioRes);
-                }
-              });
-              audioReq.on('error', () => resolve(null));
-              audioReq.on('timeout', () => { audioReq.destroy(); resolve(null); });
-            } else {
-              console.log('[player] SaveFrom: no audio URL found in response');
-              resolve(null);
-            }
-          } catch (e) {
-            console.log('[player] SaveFrom parse error:', e.message);
-            resolve(null);
-          }
-        });
-      });
-
-      req.on('error', (e) => {
-        console.log('[player] SaveFrom request error:', e.message);
-        resolve(null);
-      });
-      req.on('timeout', () => {
-        req.destroy();
-        resolve(null);
-      });
-      req.write(body);
-      req.end();
-    });
-  }
-
-  /**
    * Builds an AudioResource for a track by streaming the best audio via yt-dlp.
    * yt-dlp writes the raw audio to stdout; @discordjs/voice + ffmpeg transcode
    * it to opus (StreamType.Arbitrary).
@@ -925,82 +792,45 @@ export class Player {
     const { bin, pre } = ytdlpCmd();
     console.log(`[player] using bin="${bin}" pre=${JSON.stringify(pre)}`);
 
-    // PHASE 0: SaveFrom.net — try direct download via third-party service
-    console.log('[player] === Phase 0: SaveFrom.net ===');
-    try {
-      const sfStream = await this._trySaveFrom(url);
-      if (sfStream) {
-        console.log('[player] SaveFrom stream received, creating resource...');
-        const resource = createAudioResource(sfStream, { inputType: StreamType.Arbitrary });
-        resource.play.on('error', (e) => console.error('[player] audioPlayer error:', e.message));
-        return resource;
-      }
-    } catch (e) {
-      console.log('[player] SaveFrom failed:', e.message);
-    }
-
     // Proxy support: try multiple proxies from env var
     const proxies = this._getProxies();
-    console.log(`[player] loaded ${proxies.length} proxies: ${proxies.slice(0, 3).join(', ')}${proxies.length > 3 ? '...' : ''}`);
+    console.log(`[player] loaded ${proxies.length} proxies`);
+    const hasCookies = !!resolveCookieFile();
 
-    // Invidious instances — used as proxies via yt-dlp youtube:instance= arg.
-    // Tested working 2026-08-21 (from api.invidious.io):
-    const invidiousInstances = [
-      'https://inv.nadeko.net',           // 🇨🇱 98.6% uptime
-      'https://invidious.nerdvpn.de',     // 🇺🇦 99.9% uptime
-      'https://invidious.f5.si',          // 🇯🇵 99.8% uptime
-      'https://yt.chocolatemoo53.com',    // 🇺🇸 94.7% uptime
-      'https://invidious.tiekoetter.com', // 🇩🇪 98.0% uptime
-    ];
-
-    // Build extraction order: third-party first (no proxy needed), then YouTube direct
+    // Build extraction phases — go straight to yt-dlp
     const allAttempts = [];
 
-    // PHASE 1: Third-party (Invidious) — bypass YouTube CDN, no proxy needed
-    const thirdPartyExtractors = invidiousInstances.map(instance => {
-      return ['--extractor-args', `youtube:instance=${instance}`];
-    });
-    allAttempts.push({
-      phase: 'third-party',
-      proxy: null,
-      extractorSets: thirdPartyExtractors,
-      formatSelectors: ['bestaudio/best'],
-    });
-
-    // PHASE 2: Direct YouTube with cookies — bypass bot check with auth
-    const hasCookies = !!resolveCookieFile();
+    // PHASE 1: YouTube direct with cookies
     if (hasCookies) {
       allAttempts.push({
-        phase: 'youtube-cookies',
+        phase: 'yt+cookies',
         proxy: null,
-        extractorSets: [
-          antiBotArgs(),
-        ],
+        extractorSets: [antiBotArgs()],
         formatSelectors: ['bestaudio/best'],
       });
     }
 
-    // PHASE 3: Direct YouTube without cookies — try different clients
-    const fallbackExtractors = [
-      ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-      ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
-      ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
-    ];
+    // PHASE 2: YouTube direct without cookies, different clients
     allAttempts.push({
-      phase: 'youtube-no-cookies',
+      phase: 'yt-no-cookies',
       proxy: null,
-      extractorSets: fallbackExtractors,
+      extractorSets: [
+        ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
+        ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
+        ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
+      ],
       formatSelectors: ['bestaudio/best'],
     });
 
-    // PHASE 4: Each proxy with direct YouTube extractors
+    // PHASE 3: Each proxy with YouTube (most likely to work from datacenter IPs)
     for (const proxy of proxies) {
       allAttempts.push({
         phase: 'proxy',
         proxy,
         extractorSets: [
+          ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
           ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-          ['--extractor-args', 'youtube:player_client=web', '--extractor-retries', '5'],
+          ...(hasCookies ? [antiBotArgs()] : []),
         ],
         formatSelectors: ['bestaudio/best'],
       });
@@ -1009,11 +839,13 @@ export class Player {
     for (let attemptIdx = 0; attemptIdx < allAttempts.length; attemptIdx++) {
       const { phase, proxy, extractorSets: sets, formatSelectors } = allAttempts[attemptIdx];
       const proxyArgs = proxy ? ['--proxy', proxy] : [];
+      const proxyLabel = proxy ? proxy.substring(0, 50) + '...' : 'direct';
 
-      console.log(`[player] === Phase ${attemptIdx+1}/${allAttempts.length}: ${phase}${proxy ? ' (proxy=' + proxy.substring(0, 40) + '...)' : ''} ===`);
+      console.log(`[player] === Attempt ${attemptIdx+1}/${allAttempts.length}: ${phase} (${proxyLabel}) ===`);
 
       for (let setIdx = 0; setIdx < sets.length; setIdx++) {
         for (const format of formatSelectors) {
+          const extraArgs = sets[setIdx];
           const args = [
             '-f', format,
             '--no-playlist',
@@ -1021,14 +853,14 @@ export class Player {
             '--no-warnings',
             ...proxyArgs,
             '-o', '-',
-            ...sets[setIdx],
+            ...extraArgs,
             url,
           ];
-          console.log(`[player] trying format=${format} extractor=${JSON.stringify(sets[setIdx]).substring(0, 60)}...`);
+          console.log(`[player] cmd: ${args.join(' ').substring(0, 150)}...`);
           const result = await this._trySpawnStream(bin, pre, track, url, args);
 
           if (result) {
-            console.log(`[player] SUCCESS in phase: ${phase}!`);
+            console.log(`[player] SUCCESS in attempt ${attemptIdx+1} (${phase})!`);
             return result;
           }
         }
@@ -1038,7 +870,7 @@ export class Player {
         }
       }
 
-      console.log(`[player] phase ${phase} failed, moving to next...`);
+      console.log(`[player] attempt ${attemptIdx+1} (${phase}) failed`);
     }
 
     throw new Error('All extraction attempts failed. Try: 1) Add fresh proxies to YTDLP_PROXIES env var, 2) Use fresh YOUTUBE_COOKIES, or 3) Switch hosting provider.');
