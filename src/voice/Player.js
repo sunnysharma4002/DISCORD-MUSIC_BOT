@@ -892,6 +892,8 @@ export class Player {
       const { proxy, extractorSets: sets, formatSelectors } = allAttempts[attemptIdx];
       const proxyArgs = proxy ? ['--proxy', proxy] : [];
 
+      console.log(`[player] === Starting attempt ${attemptIdx+1}/${allAttempts.length} (proxy=${proxy ? proxy.substring(0, 50) + '...' : 'direct'}) ===`);
+
       for (let setIdx = 0; setIdx < sets.length; setIdx++) {
         for (const format of formatSelectors) {
           const args = [
@@ -904,20 +906,21 @@ export class Player {
             ...sets[setIdx],
             url,
           ];
-          console.log(`[player] attempt ${attemptIdx+1}/${allAttempts.length} (proxy=${proxy || 'direct'}, format=${format})`);
+          console.log(`[player] trying format=${format} extractor=${sets[setIdx][0]}...`);
           const result = await this._trySpawnStream(bin, pre, track, url, args);
 
-          if (result) return result;
+          if (result) {
+            console.log(`[player] SUCCESS with attempt ${attemptIdx+1}!`);
+            return result;
+          }
         }
 
         if (setIdx < sets.length - 1) {
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 500));
         }
       }
 
-      if (proxy) {
-        console.log(`[player] proxy ${proxy} failed, trying next...`);
-      }
+      console.log(`[player] attempt ${attemptIdx+1} failed, moving to next...`);
     }
 
     throw new Error('All extraction attempts failed. Try: 1) Add fresh proxies to YTDLP_PROXIES env var, 2) Use fresh YOUTUBE_COOKIES, or 3) Switch hosting provider.');
