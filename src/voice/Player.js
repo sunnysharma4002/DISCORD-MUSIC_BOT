@@ -343,11 +343,10 @@ export class Player {
   /** Test Invidious instances connectivity */
   _testInvidious() {
     const invidiousInstances = [
-      'https://pipedapi.adminforge.de',
-      'https://pipedapi.in.projectsegfau.lt',
-      'https://pipedapi.drgns.space',
-      'https://yewtu.be',
-      'https://inv.riverside.rocks',
+      'https://inv.nadeko.net',
+      'https://invidious.nerdvpn.de',
+      'https://invidious.f5.si',
+      'https://yt.chocolatemoo53.com',
       'https://invidious.tiekoetter.com',
     ];
 
@@ -822,28 +821,21 @@ export class Player {
     const proxies = this._getProxies();
     console.log(`[player] loaded ${proxies.length} proxies: ${proxies.slice(0, 3).join(', ')}${proxies.length > 3 ? '...' : ''}`);
 
-    // Invidious/Piped instances — alternative YouTube frontends that bypass CDN blocks.
-    // Only working instances (tested 2026-08-21):
+    // Invidious instances — used as proxies via yt-dlp youtube:instance= arg.
+    // Tested working 2026-08-21 (from api.invidious.io):
     const invidiousInstances = [
-      // Working Piped instances
-      'https://pipedapi.adminforge.de',
-      'https://pipedapi.in.projectsegfau.lt',
-      'https://pipedapi.drgns.space',
-      // Working Invidious instances
-      'https://yewtu.be',
-      'https://inv.riverside.rocks',
-      'https://invidious.tiekoetter.com',
+      'https://inv.nadeko.net',           // 🇨🇱 98.6% uptime
+      'https://invidious.nerdvpn.de',     // 🇺🇦 99.9% uptime
+      'https://invidious.f5.si',          // 🇯🇵 99.8% uptime
+      'https://yt.chocolatemoo53.com',    // 🇺🇸 94.7% uptime
+      'https://invidious.tiekoetter.com', // 🇩🇪 98.0% uptime
     ];
 
     // Build extraction order: third-party first (no proxy needed), then YouTube direct
     const allAttempts = [];
 
-    // PHASE 1: Third-party (Invidious/Piped) — bypass YouTube CDN, no proxy needed
+    // PHASE 1: Third-party (Invidious) — bypass YouTube CDN, no proxy needed
     const thirdPartyExtractors = invidiousInstances.map(instance => {
-      const url = new URL(instance);
-      if (url.hostname.includes('pipedapi')) {
-        return ['--extractor-args', `youtube:player_client=web`];
-      }
       return ['--extractor-args', `youtube:instance=${instance}`];
     });
     allAttempts.push({
