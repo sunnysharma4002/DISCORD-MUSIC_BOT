@@ -552,10 +552,9 @@ export class Player {
     // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
     const extractorSets = [
       // Primary: Invidious instances (no cookies needed, bypasses YouTube CDN)
+      // Correct syntax: --extractor-args "youtube:instance=URL"
       ...invidiousInstances.map(instance => [
-        '--extractor-args', `youtube:player_client=web`,
         '--extractor-args', `youtube:instance=${instance}`,
-        '--no-check-certificates',
       ]),
       // Fallback: direct YouTube with cookies
       antiBotArgs(),
