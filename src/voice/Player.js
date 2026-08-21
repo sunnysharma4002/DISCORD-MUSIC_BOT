@@ -11,7 +11,7 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -42,6 +42,20 @@ function ytdlpCmd() {
     bin = ytdlpConstants.YOUTUBE_DL_PATH; // absolute path to bundled binary
     pre = [];
   }
+
+  // Verify binary exists and is accessible
+  if (!existsSync(bin)) {
+    console.error(`[player] ERROR: yt-dlp binary not found at ${bin}`);
+    console.error(`[player] Available paths: vendor/yt-dlp=${existsSync(_vendoredYtdlp)}, bundled=${existsSync(ytdlpConstants.YOUTUBE_DL_PATH)}`);
+  } else {
+    try {
+      const stats = statSync(bin);
+      console.log(`[player] yt-dlp binary exists: ${bin} (${stats.size} bytes, mode=${stats.mode})`);
+    } catch (e) {
+      console.error(`[player] ERROR: cannot stat yt-dlp binary: ${e.message}`);
+    }
+  }
+
   if (!_ytdlpLogged) {
     console.log(`[player] using yt-dlp: ${bin}`);
     _ytdlpLogged = true;
@@ -151,6 +165,9 @@ export class Player {
     this.guildId = guildId;
 
     this.queue = [];
+
+    // Test yt-dlp on startup
+    this._testYtdlp();
     this.current = null;
     this.history = [];
 
@@ -196,6 +213,37 @@ export class Player {
       this._notify(`⚠️ Playback error on **${this.current?.title ?? 'track'}** — skipping.`);
       // 'error' is followed by Idle, which triggers _advance()
     });
+  }
+
+  /** Test yt-dlp binary on startup */
+  _testYtdlp() {
+    const { bin, pre } = ytdlpCmd();
+    console.log(`[player] testing yt-dlp binary: ${bin}`);
+
+    const proc = spawn(bin, [...pre, '--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        console.log(`[player] yt-dlp version: ${stdout.trim()}`);
+      } else {
+        console.error(`[player] yt-dlp test FAILED (code ${code}): ${stderr.trim() || stdout.trim()}`);
+        console.error(`[player] Check that the binary is executable and your host allows outbound connections to YouTube.`);
+      }
+    });
+
+    proc.on('error', (err) => {
+      console.error(`[player] yt-dlp test ERROR: ${err.message}`);
+    });
+
+    // Timeout after 5s
+    setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch {}
+    }, 5000);
   }
 
   /* ---------------------------------------------------------------- */
@@ -705,9 +753,9 @@ export class Player {
       proc.stderr.on('data', (d) => {
         stderr += d.toString();
         const line = d.toString().trim();
-        // Only log non-binary data (yt-dlp outputs status to stderr)
-        if (line.length < 200 && !line.includes('\0')) {
-          console.log(`[player] yt-dlp (${Date.now() - startTime}ms): ${line.substring(0, 100)}`);
+        // Log all stderr data for debugging
+        if (line.length > 0 && line.length < 500) {
+          console.log(`[player] yt-dlp (${Date.now() - startTime}ms): ${line.substring(0, 200)}`);
         }
       });
 
@@ -777,10 +825,12 @@ export class Player {
         console.log(`[player] process closed code=${code} resourceCreated=${resourceCreated} elapsed=${Date.now() - startTime}ms`);
         if (!resourceCreated) {
           resourceCreated = true;
-          // Process ended without producing data
+          // Process ended without producing data - always log full stderr for debugging
+          console.error(`[player] yt-dlp full stderr (${stderr.length} chars):`);
+          console.error(stderr);
           const isBotCheck = /sign in to confirm|confirm you.re not a bot|age-restricted/i.test(stderr);
-          if (!isBotCheck && code !== 0) {
-            console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
+          if (isBotCheck) {
+            console.error('[player] Bot check detected in stderr');
           }
           resolve(null);
         }
