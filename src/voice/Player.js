@@ -343,14 +343,12 @@ export class Player {
   /** Test Invidious instances connectivity */
   _testInvidious() {
     const invidiousInstances = [
-      'https://invidious.jing.rocks',
+      'https://pipedapi.adminforge.de',
+      'https://pipedapi.in.projectsegfau.lt',
+      'https://pipedapi.drgns.space',
       'https://yewtu.be',
-      'https://invidious.fdn.fr',
       'https://inv.riverside.rocks',
-      'https://invidious.private.coffee',
-      'https://yt.artemislena.eu',
       'https://invidious.tiekoetter.com',
-      'https://inv.tux.pizza',
     ];
 
     console.log('[player] testing Invidious instances...');
@@ -825,27 +823,16 @@ export class Player {
     console.log(`[player] loaded ${proxies.length} proxies: ${proxies.slice(0, 3).join(', ')}${proxies.length > 3 ? '...' : ''}`);
 
     // Invidious/Piped instances — alternative YouTube frontends that bypass CDN blocks.
-    // These are public instances; they may be slow or down, but they work when
-    // YouTube directly blocks the server IP.
+    // Only working instances (tested 2026-08-21):
     const invidiousInstances = [
-      // Piped instances (often more reliable)
-      'https://pipedapi.kavin.rocks',
+      // Working Piped instances
       'https://pipedapi.adminforge.de',
       'https://pipedapi.in.projectsegfau.lt',
-      'https://pipedapi.freedit.eu',
       'https://pipedapi.drgns.space',
-      // Invidious instances
+      // Working Invidious instances
       'https://yewtu.be',
-      'https://invidious.private.coffee',
-      'https://inv.tux.pizza',
-      'https://vid.puffyan.us',
-      'https://invidious.fdn.fr',
       'https://inv.riverside.rocks',
-      'https://yt.artemislena.eu',
       'https://invidious.tiekoetter.com',
-      'https://invidious.jing.rocks',
-      'https://inv.vern.cc',
-      'https://y.com.cm',
     ];
 
     // Try multiple extractor arg sets — YouTube blocks some clients on datacenter IPs.
