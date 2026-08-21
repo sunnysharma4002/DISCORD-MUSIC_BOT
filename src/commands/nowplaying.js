@@ -3,7 +3,7 @@ import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 export default {
   data: new SlashCommandBuilder()
     .setName('nowplaying')
-    .setDescription('Show the currently playing track'),
+    .setDescription('Show the currently playing track with controls'),
 
   async execute(interaction) {
     const player = interaction.client.getPlayer(interaction.guild.id);
@@ -15,6 +15,13 @@ export default {
       });
     }
 
-    return interaction.reply({ embeds: [player.nowPlayingEmbed()] });
+    const embed = player.nowPlayingEmbed();
+    const row = player.controlRow();
+
+    return interaction.reply({
+      content: '## 🎵 **Now Playing**',
+      embeds: [embed],
+      components: [row],
+    });
   },
 };

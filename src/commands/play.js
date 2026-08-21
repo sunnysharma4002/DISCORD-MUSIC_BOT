@@ -116,6 +116,31 @@ export default {
 
     player.enqueue(tracks);
 
+    // Send control panel message FIRST (before starting playback)
+    // so _notifyNowPlaying can update it
+    if (startedEmpty) {
+      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
+      const embed = new EmbedBuilder().setColor(0x57f287);
+      embed
+        .setAuthor({ name: 'Playing now' })
+        .setTitle(tracks[0].title.slice(0, 250))
+        .setURL(tracks[0].url)
+        .addFields(
+          { name: 'Duration', value: tracks[0].isLive ? '🔴 Live' : fmt(tracks[0].duration), inline: true },
+          { name: 'Position', value: 'Playing now', inline: true },
+          { name: 'Source', value: sourceLabel, inline: true },
+        );
+      if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
+
+      const reply = await interaction.editReply({
+        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+        embeds: [embed],
+        components: [player.controlRow()],
+      });
+      player.controlPanelMessageId = reply.id;
+      console.log(`[player] control panel set to message ${reply.id} before playback`);
+    }
+
     try {
       await player.start();
     } catch (err) {
@@ -123,45 +148,49 @@ export default {
       return interaction.editReply(`❌ Failed to start playback: ${err.message}`);
     }
 
-    /* -- Confirmation embed ---------------------------------------- */
-    const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
-    const embed = new EmbedBuilder().setColor(0x57f287);
+    /* -- Confirmation embed (if not already sent above) ------------ */
+    if (!startedEmpty) {
+      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
+      const embed = new EmbedBuilder().setColor(0x57f287);
 
-    if (tracks.length === 1) {
-      const t = tracks[0];
-      embed
-        .setAuthor({ name: startedEmpty ? 'Playing now' : 'Added to queue' })
-        .setTitle(t.title.slice(0, 250))
-        .setURL(t.url)
-        .addFields(
-          { name: 'Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
-          {
-            name: 'Position',
-            value: startedEmpty ? 'Playing now' : `#${player.queue.length}`,
-            inline: true,
-          },
-          { name: 'Source', value: sourceLabel, inline: true },
-        );
-      if (t.thumbnail) embed.setThumbnail(t.thumbnail);
-    } else {
-      const totalMs = tracks.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
-      embed
-        .setAuthor({ name: 'Added to queue' })
-        .setTitle((playlistName ?? 'Playlist').slice(0, 250))
-        .setDescription(
-          `**${tracks.length}** tracks queued · ${fmt(totalMs)} total\n` +
-          `First up: [${tracks[0].title.slice(0, 80)}](${tracks[0].url})`,
-        )
-        .addFields({ name: 'Source', value: sourceLabel, inline: true });
-      if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
+      if (tracks.length === 1) {
+        const t = tracks[0];
+        embed
+          .setAuthor({ name: 'Added to queue' })
+          .setTitle(t.title.slice(0, 250))
+          .setURL(t.url)
+          .addFields(
+            { name: 'Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
+            {
+              name: 'Position',
+              value: `#${player.queue.length}`,
+              inline: true,
+            },
+            { name: 'Source', value: sourceLabel, inline: true },
+          );
+        if (t.thumbnail) embed.setThumbnail(t.thumbnail);
+      } else {
+        const totalMs = tracks.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
+        embed
+          .setAuthor({ name: 'Added to queue' })
+          .setTitle((playlistName ?? 'Playlist').slice(0, 250))
+          .setDescription(
+            `**${tracks.length}** tracks queued · ${fmt(totalMs)} total\n` +
+            `First up: [${tracks[0].title.slice(0, 80)}](${tracks[0].url})`,
+          )
+          .addFields({ name: 'Source', value: sourceLabel, inline: true });
+        if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
+      }
+
+      const notes = [];
+      if (skipped > 0) notes.push(`${skipped} track${skipped === 1 ? '' : 's'} couldn't be found on YouTube`);
+      if (truncated) notes.push('list truncated to the first 60 tracks');
+      if (notes.length > 0) embed.setFooter({ text: notes.join(' · ') });
+
+      return interaction.editReply({ embeds: [embed] });
     }
 
-    const notes = [];
-    if (skipped > 0) notes.push(`${skipped} track${skipped === 1 ? '' : 's'} couldn't be found on YouTube`);
-    if (truncated) notes.push('list truncated to the first 60 tracks');
-    if (notes.length > 0) embed.setFooter({ text: notes.join(' · ') });
-
-    return interaction.editReply({ embeds: [embed] });
+    return;
   },
 };
 

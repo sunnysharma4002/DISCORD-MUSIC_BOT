@@ -15,6 +15,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 
@@ -161,6 +162,8 @@ export class Player {
     this.autoplay = false;    // auto-search related when queue empties
     this.theme = 'default';   // embed color theme
     this.destroyed = false;
+    this.controlPanelMessageId = null; // persistent control panel message ID
+    this._progressInterval = null; // periodic progress update for control panel
 
     this._stuckTimer = null;
     this._idleLeaveTimer = null;
@@ -168,10 +171,18 @@ export class Player {
     this._advancing = false;  // guards against double-advance races
 
     this.audioPlayer = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
     });
 
-    this.audioPlayer.on(AudioPlayerStatus.Playing, () => this._clearStuckTimer());
+    // Log all audio player state changes for debugging
+    this.audioPlayer.on('stateChange', (oldState, newState) => {
+      console.log(`[audio] state: ${oldState.status} → ${newState.status}`);
+    });
+
+    this.audioPlayer.on(AudioPlayerStatus.Playing, () => {
+      console.log('[audio] now Playing');
+      this._clearStuckTimer();
+    });
 
     this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
       this._clearStuckTimer();
@@ -180,6 +191,8 @@ export class Player {
 
     this.audioPlayer.on('error', (err) => {
       console.error(`[player] audio error on "${this.current?.title}":`, err.message);
+      console.error(`[player] connection state: ${this.connection?.state.status ?? 'null'}`);
+      console.error(`[player] audioPlayer state: ${this.audioPlayer.state.status}`);
       this._notify(`⚠️ Playback error on **${this.current?.title ?? 'track'}** — skipping.`);
       // 'error' is followed by Idle, which triggers _advance()
     });
@@ -225,6 +238,9 @@ export class Player {
       console.error(`[voice] connection error (code ${code ?? '?'}):`, msg);
     });
 
+    connection.subscribe(this.audioPlayer);
+    console.log(`[voice] audioPlayer subscribed to connection (guild: ${this.guildId})`);
+
     // Log every state transition — tells us WHERE it gets stuck.
     //   Signalling → Connecting → Ready   = healthy
     //   stuck in Signalling               = voice server update never arrived (gateway)
@@ -232,6 +248,11 @@ export class Player {
     connection.on('stateChange', (oldState, newState) => {
       if (oldState.status !== newState.status) {
         console.log(`[voice] state: ${oldState.status} → ${newState.status}`);
+        // Re-subscribe on Ready to ensure audio pipe is connected
+        if (newState.status === VoiceConnectionStatus.Ready) {
+          console.log(`[voice] re-subscribing audioPlayer`);
+          connection.subscribe(this.audioPlayer);
+        }
       }
     });
 
@@ -307,11 +328,13 @@ export class Player {
     this.destroyed = true;
 
     this._clearStuckTimer();
+    this._stopProgressUpdates();
     if (this._idleLeaveTimer) clearTimeout(this._idleLeaveTimer);
     if (this.emptyChannelTimeout) clearTimeout(this.emptyChannelTimeout);
 
     this.queue = [];
     this.current = null;
+    this.controlPanelMessageId = null;
 
     try { this.audioPlayer.stop(true); } catch {}
     try { this._activeProc?.kill('SIGKILL'); } catch {}
@@ -446,13 +469,42 @@ export class Player {
   }
 
   async _play(track) {
-    if (this.destroyed) return;
+    if (this.destroyed) {
+      console.warn('[player] _play called but player is destroyed');
+      return;
+    }
+
+    // Ensure voice connection is ready before playing
+    if (!this.connection || this.connection.state.status !== VoiceConnectionStatus.Ready) {
+      console.warn(`[player] connection not ready (status: ${this.connection?.state?.status ?? 'null'}), waiting...`);
+      if (this.connection) {
+        try {
+          await entersState(this.connection, VoiceConnectionStatus.Ready, 10_000);
+          console.log('[player] connection ready, proceeding');
+        } catch (err) {
+          throw new Error('Voice connection not ready — make sure the bot is in a voice channel.');
+        }
+      } else {
+        throw new Error('No voice connection — use /play in a voice channel.');
+      }
+    }
 
     try {
+      console.log(`[player] creating resource for "${track.title?.substring(0, 50)}"`);
       const resource = await this._createResource(track);
+      console.log(`[player] resource created, playing. connection=${!!this.connection} state=${this.connection?.state?.status}`);
+
+      // Re-subscribe right before playing to ensure audio pipe is connected
+      if (this.connection) {
+        this.connection.subscribe(this.audioPlayer);
+        console.log(`[player] re-subscribed audioPlayer to connection`);
+      }
+
       this.audioPlayer.play(resource);
+      console.log(`[player] audioPlayer state after play: ${this.audioPlayer.state.status}`);
       this._startStuckTimer(track);
       this._cancelIdleLeave();
+      this._startProgressUpdates();
       this._notifyNowPlaying(track);
     } catch (err) {
       console.error(`[player] failed to stream "${track.title}":`, err.message);
@@ -468,45 +520,92 @@ export class Player {
 
   /**
    * Searches YouTube for a track related to the finished one (autoplay).
-   * Builds query from artist name + "mix" or title keywords.
+   * Uses history of played songs to find better matches.
    * Returns a youtube-sr Video or null on failure.
    */
   async _searchRelated(finished) {
     try {
-      // Build a related query from the finished track's metadata
+      // Build a smarter query using recent history for better recommendations
+      const recentTracks = [finished, ...this.history.slice(-5)].filter(t => t);
+      const allAuthors = recentTracks.map(t => t.author).filter(a => a && a !== 'Unknown');
+      const allGenres = new Set();
+
+      // Detect genre/style from recent tracks
+      for (const track of recentTracks) {
+        const title = (track.title || '').toLowerCase();
+        const author = (track.author || '').toLowerCase();
+
+        // Check for common genre keywords
+        const genres = ['rock', 'pop', 'hip hop', 'rap', 'electronic', 'edm', 'dance',
+          'country', 'jazz', 'classical', 'metal', 'indie', 'r&b', 'soul', 'funk',
+          'reggae', 'blues', 'folk', 'punk', 'alternative', 'lofi', 'chill'];
+        for (const g of genres) {
+          if (title.includes(g) || author.includes(g)) {
+            allGenres.add(g);
+          }
+        }
+      }
+
+      // Build query: prefer artist name + genre if available
       let query = '';
-      if (finished.author && finished.author !== 'Unknown') {
+      const mostCommonAuthor = allAuthors.length > 0
+        ? allAuthors.sort((a, b) => allAuthors.filter(v => v === a).length - allAuthors.filter(v => v === b).length).pop()
+        : null;
+
+      if (mostCommonAuthor && allGenres.size > 0) {
+        // Same artist + similar genre
+        const genre = [...allGenres][0];
+        query = `${mostCommonAuthor} ${genre}`;
+      } else if (mostCommonAuthor) {
+        // Same artist style
+        query = `${mostCommonAuthor} songs`;
+      } else if (allGenres.size > 0) {
+        // Similar genre mix
+        const genre = [...allGenres].slice(0, 2).join(' ');
+        query = `${genre} mix 2024`;
+      } else if (finished.author && finished.author !== 'Unknown') {
         query = `${finished.author} mix`;
       } else if (finished.title && finished.title !== 'YouTube video') {
-        // Strip common noise words from title for search
         query = finished.title
-          .replace(/\(.*?\)|\[.*?\]|Official|Music Video|Lyrics|Audio/gi, '')
+          .replace(/\(.*?\)|\[.*?\]|Official|Music Video|Lyrics|Audio|Remix|Cover/gi, '')
           .replace(/\s+/g, ' ')
           .trim()
           .slice(0, 60);
-        if (query) query += ' mix';
+        if (query) query += ' songs';
       }
 
-      if (!query) query = `${finished.title || 'music'} mix`;
+      if (!query) query = 'popular music mix 2024';
 
-      const results = await YouTube.search(query, { limit: 10, type: 'video' });
+      console.log(`[player] autoplay query: "${query}" (from ${recentTracks.length} recent tracks)`);
+
+      const results = await YouTube.search(query, { limit: 15, type: 'video' });
       if (!Array.isArray(results) || results.length === 0) return null;
 
-      // Pick a random result that isn't the same video
-      const candidates = results.filter(v => v?.id && v.id !== finished.videoId);
+      // Filter out already played tracks (check last 20 in history + current)
+      const playedIds = new Set([
+        ...(this.history.slice(-20).map(t => t.videoId)),
+        ...(recentTracks.map(t => t.videoId)),
+      ]);
+
+      const candidates = results.filter(v => v?.id && !playedIds.has(v.id));
       if (candidates.length === 0) return null;
 
-      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      // Pick the highest quality result (prefer videos with duration > 2 min)
+      const goodCandidates = candidates.filter(v => (v.duration || 0) > 120);
+      const pick = goodCandidates.length > 0
+        ? goodCandidates[Math.floor(Math.random() * goodCandidates.length)]
+        : candidates[Math.floor(Math.random() * candidates.length)];
+
       return {
         title: pick.title ?? 'Unknown title',
         url: pick.url ?? `https://www.youtube.com/watch?v=${pick.id}`,
         videoId: pick.id,
-        duration: (Number(pick.duration) || 0),
+        duration: (Number(pick.duration) || 0) * 1000, // youtube-sr returns seconds
         isLive: Boolean(pick.live),
         thumbnail: pick.thumbnail?.url ?? `https://i.ytimg.com/vi/${pick.id}/hqdefault.jpg`,
         author: pick.channel?.name ?? 'Unknown',
         source: 'youtube',
-        requestedBy: finished.requestedBy, // keep original requester
+        requestedBy: finished.requestedBy,
       };
     } catch (err) {
       console.warn('[player] autoplay search failed:', err.message);
@@ -523,9 +622,11 @@ export class Player {
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
+    console.log(`[player] _createResource called: title="${track.title?.substring(0, 50)}" url="${url?.substring(0, 60)}" videoId="${track.videoId}"`);
 
     // Enrich metadata (title/duration/author) if missing — best-effort, non-fatal.
     if (!track.duration || !track.author || track.title === 'YouTube video') {
+      console.log(`[player] enriching metadata for "${track.title}"`);
       try {
         await this._enrichMetadata(track, url);
       } catch (err) {
@@ -534,6 +635,7 @@ export class Player {
     }
 
     const { bin, pre } = ytdlpCmd();
+    console.log(`[player] using bin="${bin}" pre=${JSON.stringify(pre)}`);
 
     // Invidious instances — alternative YouTube frontends that bypass CDN blocks.
     // These are public instances; they may be slow or down, but they work when
@@ -590,44 +692,105 @@ export class Player {
   /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
   async _trySpawnStream(bin, pre, track, url, args) {
     return new Promise((resolve) => {
+      console.log(`[player] spawning: ${bin} ${args.slice(0, 3).join(' ')}...`);
       const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
       let stderr = '';
-      let gotData = false;
-      proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      proc.stdout.on('data', () => { gotData = true; });
+      let startTime = Date.now();
+      let resourceCreated = false;
+      let dataChunks = [];
+      let totalBytes = 0;
+      const MIN_BYTES = 64 * 1024; // Wait for at least 64KB before creating resource
 
-      proc.on('error', () => resolve(null));
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+        const line = d.toString().trim();
+        // Only log non-binary data (yt-dlp outputs status to stderr)
+        if (line.length < 200 && !line.includes('\0')) {
+          console.log(`[player] yt-dlp (${Date.now() - startTime}ms): ${line.substring(0, 100)}`);
+        }
+      });
+
+      // Collect initial data, then create resource once we have enough buffered
+      const createResource = () => {
+        if (resourceCreated) return;
+        resourceCreated = true;
+        console.log(`[player] creating resource after ${Date.now() - startTime}ms (${totalBytes} bytes buffered)`);
+
+        // Create a pass-through stream from buffered data + remaining stdout
+        const pass = new PassThrough({ highWaterMark: 256 * 1024 });
+
+        // Write buffered chunks
+        for (const chunk of dataChunks) {
+          pass.write(chunk);
+        }
+        dataChunks = null; // Free memory
+
+        // Pipe remaining stdout data
+        proc.stdout.pipe(pass, { end: false });
+
+        pass.on('error', (err) => {
+          if (err?.code === 'EPIPE' || err?.message?.includes('aborted')) return;
+          console.error('[player] pass-through stream error:', err.message);
+        });
+
+        pass.on('end', () => {
+          console.log('[player] stream ended');
+          try { proc.kill('SIGKILL'); } catch {}
+        });
+
+        this._activeProc = proc;
+        const resource = createAudioResource(pass, {
+          inputType: StreamType.Arbitrary,
+          inlineVolume: false,
+          metadata: track,
+        });
+        console.log(`[player] AudioResource created, volume=${resource.volume?.volume ?? 'N/A'}`);
+        resolve(resource);
+      };
+
+      proc.stdout.on('data', (chunk) => {
+        if (resourceCreated) return;
+        dataChunks.push(chunk);
+        totalBytes += chunk.length;
+        if (totalBytes >= MIN_BYTES) {
+          createResource();
+        }
+      });
+
+      // Fallback: if stream ends before we get enough data, still try
+      proc.stdout.on('end', () => {
+        if (!resourceCreated && totalBytes > 0) {
+          createResource();
+        }
+      });
+
+      proc.on('error', (err) => {
+        console.error(`[player] spawn error: ${err.message}`);
+        if (!resourceCreated) {
+          resourceCreated = true;
+          resolve(null);
+        }
+      });
 
       proc.on('close', (code) => {
-        // If we got audio data, it's working — return the resource
-        if (gotData && code === 0) {
-          const stream = proc.stdout;
-          stream.on('error', (err) => {
-            if (err?.message?.includes('aborted') || err?.code === 'EPIPE') return;
-            console.error('[player] stream error:', err.message);
-          });
-          stream.once('close', () => { try { proc.kill('SIGKILL'); } catch {} });
-          this._activeProc = proc;
-          resolve(createAudioResource(stream, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: false,
-            metadata: track,
-          }));
-          return;
+        console.log(`[player] process closed code=${code} resourceCreated=${resourceCreated} elapsed=${Date.now() - startTime}ms`);
+        if (!resourceCreated) {
+          resourceCreated = true;
+          // Process ended without producing data
+          const isBotCheck = /sign in to confirm|confirm you.re not a bot|age-restricted/i.test(stderr);
+          if (!isBotCheck && code !== 0) {
+            console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
+          }
+          resolve(null);
         }
-
-        // Check if it's a bot check error
-        const isBotCheck = /sign in to confirm|confirm you.re not a bot|age-restricted/i.test(stderr);
-        if (!isBotCheck && code !== 0) {
-          console.error(`[player] yt-dlp exited ${code}: ${stderr.slice(0, 300)}`);
-        }
-        resolve(null);
       });
 
       // Timeout after 45s — Invidious can be slower than direct YouTube
       setTimeout(() => {
-        if (!gotData) {
+        if (!resourceCreated) {
+          console.warn('[player] timeout waiting for data, killing process');
+          resourceCreated = true;
           try { proc.kill('SIGKILL'); } catch {}
           resolve(null);
         }
@@ -728,7 +891,87 @@ export class Player {
     if (!channel?.isTextBased()) return;
     const embed = this.nowPlayingEmbed();
     const row = this.controlRow();
-    channel.send({ embeds: [embed], components: [row] }).catch(() => {});
+
+    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}" controlPanel=${this.controlPanelMessageId}`);
+
+    // Update existing control panel if it exists
+    if (this.controlPanelMessageId) {
+      channel.messages.edit(this.controlPanelMessageId, {
+        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+        embeds: [embed],
+        components: [row],
+      }).then(() => {
+        console.log(`[player] control panel updated`);
+      }).catch((err) => {
+        console.warn(`[player] control panel edit failed: ${err.code} ${err.message}`);
+        if (err?.code === 10008) {
+          this.controlPanelMessageId = null;
+        }
+      });
+    } else {
+      // No control panel - send a new message
+      channel.send({
+        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+        embeds: [embed],
+        components: [row],
+      }).then((msg) => {
+        this.controlPanelMessageId = msg.id;
+        console.log(`[player] control panel sent, id=${msg.id}`);
+      }).catch((err) => {
+        console.warn(`[player] control panel send failed: ${err.code} ${err.message}`);
+      });
+    }
+  }
+
+  /** Update the control panel with current state (progress, buttons, etc.) */
+  async updateControlPanel() {
+    if (!this.controlPanelMessageId) return;
+
+    const channel = this.client.channels.cache.get(this.textChannelId);
+    if (!channel?.isTextBased()) return;
+
+    const embed = this.nowPlayingEmbed();
+    const row = this.controlRow();
+
+    console.log(`[player] updateControlPanel called for message ${this.controlPanelMessageId}`);
+
+    try {
+      // Edit the existing message
+      await channel.messages.edit(this.controlPanelMessageId, {
+        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+        embeds: [embed],
+        components: [row],
+      });
+      console.log('[player] control panel edit succeeded');
+    } catch (err) {
+      console.warn(`[player] control panel edit failed: ${err.code} ${err.message}`);
+      if (err?.code === 10008) {
+        // Message deleted - clear ID
+        this.controlPanelMessageId = null;
+      }
+    }
+  }
+
+  /** Start periodic progress updates for the control panel */
+  _startProgressUpdates() {
+    this._stopProgressUpdates();
+    if (!this.controlPanelMessageId) return;
+
+    this._progressInterval = setInterval(() => {
+      if (this.destroyed || !this.isPlaying) {
+        this._stopProgressUpdates();
+        return;
+      }
+      this.updateControlPanel().catch(() => {});
+    }, 30000); // Update every 30 seconds (less spammy)
+  }
+
+  /** Stop periodic progress updates */
+  _stopProgressUpdates() {
+    if (this._progressInterval) {
+      clearInterval(this._progressInterval);
+      this._progressInterval = null;
+    }
   }
 
   /** Playback control buttons attached to now-playing messages. */
@@ -736,23 +979,23 @@ export class Player {
     return new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId('player_prev')
-        .setLabel('⏮')
+        .setLabel('Previous')
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId('player_pause')
-        .setLabel(this.isPaused ? '▶' : '⏸')
+        .setLabel(this.isPaused ? 'Play' : 'Pause')
         .setStyle(this.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId('player_skip')
-        .setLabel('⏭')
+        .setLabel('Skip')
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId('player_stop')
-        .setLabel('⏹')
+        .setLabel('Stop')
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
         .setCustomId('player_autoplay')
-        .setLabel(this.autoplay ? '🔁 ON' : '🔁 OFF')
+        .setLabel(this.autoplay ? 'Autoplay: ON' : 'Autoplay: OFF')
         .setStyle(this.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
     );
   }
@@ -770,6 +1013,10 @@ export class Player {
     }
 
     const themeColor = this.theme ? THEMES[this.theme]?.color ?? 0x5865f2 : 0x5865f2;
+    const playback = this.playbackMs;
+    const duration = t.duration || 0;
+
+    console.log(`[player] nowPlayingEmbed: title="${t.title?.substring(0, 40)}" duration=${fmt(duration)} playback=${fmt(playback)} thumbnail=${!!t.thumbnail}`);
 
     const embed = new EmbedBuilder()
       .setColor(themeColor)
@@ -784,19 +1031,26 @@ export class Player {
 
     if (t.isLive) {
       embed.addFields({ name: 'Duration', value: '🔴 Live', inline: false });
-    } else if (t.duration > 0) {
+    } else if (duration > 0) {
+      const bar = progressBar(playback, duration);
       embed.addFields({
         name: 'Progress',
-        value: `${progressBar(this.playbackMs, t.duration)}\n\`${fmt(this.playbackMs)} / ${fmt(t.duration)}\``,
+        value: `${bar}\n\`${fmt(playback)} / ${fmt(duration)}\``,
         inline: false,
       });
+      console.log(`[player] progress bar: ${bar} ${fmt(playback)}/${fmt(duration)}`);
+    } else {
+      console.log(`[player] no duration for progress bar, duration=${duration}`);
     }
 
     if (t.spotifyTitle) {
       embed.setFooter({ text: `Spotify: ${truncate(t.spotifyTitle, 200)}` });
     }
 
-    if (t.thumbnail) embed.setThumbnail(t.thumbnail);
+    if (t.thumbnail) {
+      embed.setThumbnail(t.thumbnail);
+      console.log(`[player] thumbnail set: ${t.thumbnail.substring(0, 60)}...`);
+    }
 
     return embed;
   }

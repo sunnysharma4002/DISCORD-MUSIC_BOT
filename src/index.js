@@ -161,20 +161,57 @@ async function handleButton(interaction) {
 
     case 'player_autoplay':
       player.autoplay = !player.autoplay;
+      console.log(`[player] autoplay toggled: ${player.autoplay}`);
       await interaction.deferUpdate();
+
+      // Update the control panel to reflect the new autoplay state
+      if (player.controlPanelMessageId) {
+        const channel = player.client.channels.cache.get(player.textChannelId);
+        if (channel?.isTextBased()) {
+          const embed = player.nowPlayingEmbed();
+          const row = player.controlRow();
+          channel.messages.edit(player.controlPanelMessageId, {
+            content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+            embeds: [embed],
+            components: [row],
+          }).then(() => {
+            console.log('[player] control panel updated after autoplay toggle');
+          }).catch((err) => {
+            console.warn(`[player] autoplay panel update failed: ${err.code} ${err.message}`);
+          });
+        }
+      }
       break;
 
     default:
       break;
   }
 
-  // Re-send now playing with updated buttons after a short delay
-  // so the button states reflect the new player state
-  setTimeout(() => {
-    if (player.current && !player.destroyed) {
-      player._notifyNowPlaying(player.current);
+  // Update button states after a delay to reflect the new player state
+  // Wait longer for skip/prev since _advance() needs time to fetch the next track
+  const updateDelay = (id === 'player_skip' || id === 'player_prev') ? 2000 : 500;
+
+  setTimeout(async () => {
+    if (player.destroyed) return;
+
+    // Update the control panel if it exists
+    if (player.controlPanelMessageId && player.current) {
+      const channel = player.client.channels.cache.get(player.textChannelId);
+      if (channel?.isTextBased()) {
+        const embed = player.nowPlayingEmbed();
+        const row = player.controlRow();
+        channel.messages.edit(player.controlPanelMessageId, {
+          content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+          embeds: [embed],
+          components: [row],
+        }).then(() => {
+          console.log('[player] control panel updated after button press');
+        }).catch((err) => {
+          console.warn(`[player] control panel update failed: ${err.code} ${err.message}`);
+        });
+      }
     }
-  }, 500);
+  }, updateDelay);
 }
 
 /* Command dispatch ---------------------------------------------------- */
