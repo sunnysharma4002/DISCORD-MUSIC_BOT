@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
-import { get } from 'node:https';
+import { get, request as httpsRequest } from 'node:https';
+import { request as httpRequest } from 'node:http';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 
@@ -85,11 +86,29 @@ function resolveCookieFile() {
       let contents = process.env.YOUTUBE_COOKIES;
       // Netscape files must start with this header line or yt-dlp rejects them.
       if (!contents.startsWith('# Netscape') && !contents.startsWith('# HTTP')) {
-        contents = '# Netscape HTTP Cookie File\n' + contents;
+        // Check if it's browser cookie header format (key=value;key=value)
+        // vs already Netscape format (tab-separated lines)
+        if (contents.includes(';') && !contents.includes('\t')) {
+          // Convert browser cookie header to Netscape format
+          const pairs = contents.split(';').map(s => s.trim()).filter(Boolean);
+          const lines = ['# Netscape HTTP Cookie File'];
+          for (const pair of pairs) {
+            const eqIdx = pair.indexOf('=');
+            if (eqIdx === -1) continue;
+            const name = pair.substring(0, eqIdx).trim();
+            const value = pair.substring(eqIdx + 1).trim();
+            // Netscape format: domain  flag  path  secure  expiration  name  value
+            lines.push(`.youtube.com\tTRUE\t/\tTRUE\t0\t${name}\t${value}`);
+          }
+          contents = lines.join('\n');
+        } else {
+          contents = '# Netscape HTTP Cookie File\n' + contents;
+        }
       }
       writeFileSync(p, contents);
       _cookieFileCache = p;
       console.log('[player] wrote YouTube cookies from env to', p);
+      console.log('[player] cookie lines:', contents.split('\n').length);
     } catch (err) {
       console.warn('[player] failed to write cookies from env:', err.message);
       _cookieFileCache = null;
@@ -794,6 +813,97 @@ export class Player {
   }
 
   /**
+   * Try SaveFrom.net worker API to get a direct audio download URL.
+   * Returns a ReadableStream of audio data or null on failure.
+   */
+  _trySaveFrom(videoUrl) {
+    return new Promise((resolve) => {
+      const ts = Date.now();
+      const params = new URLSearchParams();
+      params.append('_ts', String(ts));
+      params.append('_tsc', '0');
+      params.append('_x', '1');
+      params.append('app', '');
+      params.append('browser', 'Chrome');
+      params.append('channel', 'article');
+      params.append('country', 'in');
+      params.append('lang', 'en');
+      params.append('new', '2');
+      params.append('os', 'Windows');
+      params.append('sf-nomad', '1');
+      params.append('sf_submit', '');
+      params.append('sf_url', videoUrl);
+      params.append('ts', String(ts + 87000));
+
+      const body = params.toString();
+      const options = {
+        hostname: 'worker.savefrom.net',
+        path: '/savefrom.php',
+        method: 'POST',
+        timeout: 20000,
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Origin': 'https://en.savefrom.net',
+          'Referer': 'https://en.savefrom.net/',
+        },
+      };
+
+      const req = httpsRequest(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          try {
+            console.log(`[player] SaveFrom response: status=${res.statusCode} len=${data.length}`);
+            // SaveFrom returns HTML or JSON with the download URL
+            // Look for audio URL in the response
+            const audioMatch = data.match(/"url"\s*:\s*"(https?:\/\/[^"]+audio[^"]+)"/i)
+              || data.match(/"url"\s*:\s*"(https?:\/\/[^"]+)"/i)
+              || data.match(/href="(https?:\/\/[^"]*\.(?:mp3|m4a|ogg|opus|wav|webm)[^"]*)"/i);
+            if (audioMatch) {
+              const audioUrl = audioMatch[1];
+              console.log(`[player] SaveFrom found URL: ${audioUrl.substring(0, 80)}...`);
+              // Fetch the audio stream
+              const audioReq = get(audioUrl, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (audioRes) => {
+                if (audioRes.statusCode >= 300 && audioRes.statusCode < 400 && audioRes.headers.location) {
+                  // Follow redirect
+                  const redirectReq = get(audioRes.headers.location, { timeout: 20000 }, (redirRes) => {
+                    resolve(redirRes);
+                  });
+                  redirectReq.on('error', () => resolve(null));
+                  redirectReq.on('timeout', () => { redirectReq.destroy(); resolve(null); });
+                } else {
+                  resolve(audioRes);
+                }
+              });
+              audioReq.on('error', () => resolve(null));
+              audioReq.on('timeout', () => { audioReq.destroy(); resolve(null); });
+            } else {
+              console.log('[player] SaveFrom: no audio URL found in response');
+              resolve(null);
+            }
+          } catch (e) {
+            console.log('[player] SaveFrom parse error:', e.message);
+            resolve(null);
+          }
+        });
+      });
+
+      req.on('error', (e) => {
+        console.log('[player] SaveFrom request error:', e.message);
+        resolve(null);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.write(body);
+      req.end();
+    });
+  }
+
+  /**
    * Builds an AudioResource for a track by streaming the best audio via yt-dlp.
    * yt-dlp writes the raw audio to stdout; @discordjs/voice + ffmpeg transcode
    * it to opus (StreamType.Arbitrary).
@@ -816,6 +926,20 @@ export class Player {
 
     const { bin, pre } = ytdlpCmd();
     console.log(`[player] using bin="${bin}" pre=${JSON.stringify(pre)}`);
+
+    // PHASE 0: SaveFrom.net — try direct download via third-party service
+    console.log('[player] === Phase 0: SaveFrom.net ===');
+    try {
+      const sfStream = await this._trySaveFrom(url);
+      if (sfStream) {
+        console.log('[player] SaveFrom stream received, creating resource...');
+        const resource = createAudioResource(sfStream, { inputType: StreamType.Arbitrary });
+        resource.play.on('error', (e) => console.error('[player] audioPlayer error:', e.message));
+        return resource;
+      }
+    } catch (e) {
+      console.log('[player] SaveFrom failed:', e.message);
+    }
 
     // Proxy support: try multiple proxies from env var
     const proxies = this._getProxies();
