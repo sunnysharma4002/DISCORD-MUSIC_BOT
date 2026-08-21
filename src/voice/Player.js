@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
+import { get } from 'node:https';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 
@@ -244,6 +245,50 @@ export class Player {
     setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
     }, 5000);
+
+    // Test Invidious connectivity
+    this._testInvidious();
+  }
+
+  /** Test Invidious instances connectivity */
+  _testInvidious() {
+    const invidiousInstances = [
+      'https://invidious.jing.rocks',
+      'https://yewtu.be',
+      'https://invidious.fdn.fr',
+      'https://inv.riverside.rocks',
+      'https://invidious.private.coffee',
+      'https://yt.artemislena.eu',
+      'https://invidious.tiekoetter.com',
+      'https://inv.tux.pizza',
+    ];
+
+    console.log('[player] testing Invidious instances...');
+    for (const instance of invidiousInstances) {
+      const url = new URL(instance);
+      const req = get({
+        hostname: url.hostname,
+        path: '/api/v1/videos/dQw4w9WgXcQ',
+        headers: { 'User-Agent': 'discord-music-bot' },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          if (res.statusCode === 200 && data.length > 0) {
+            console.log(`[player] Invidious OK: ${instance} (${res.statusCode})`);
+          } else {
+            console.warn(`[player] Invidious FAIL: ${instance} (${res.statusCode})`);
+          }
+        });
+      });
+      req.on('error', (err) => {
+        console.warn(`[player] Invidious ERROR: ${instance} - ${err.message}`);
+      });
+      req.setTimeout(5000, () => {
+        console.warn(`[player] Invidious TIMEOUT: ${instance}`);
+        req.destroy();
+      });
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -712,6 +757,8 @@ export class Player {
       ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
       // Fallback: TV embedded (least aggressive checking)
       ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
+      // Fallback: try with user-agent spoofing
+      ['--add-header', 'User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1', '--extractor-retries', '5'],
     ];
 
     for (let attempt = 0; attempt < extractorSets.length; attempt++) {
