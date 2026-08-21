@@ -126,7 +126,7 @@ function antiBotArgs() {
 
   const args = [
     // Try multiple player clients — mobile/TV clients are less aggressively checked.
-    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
+    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
     // Skip HLS formats (often require additional auth)
     '--extractor-args', 'youtube:player_skip=hls',
     // Aggressive retries
@@ -136,8 +136,6 @@ function antiBotArgs() {
     '--referer', 'https://www.youtube.com/',
     // Skip certificate verification (helps with some proxy setups)
     '--no-check-certificate',
-    // Prefer formats that work better with datacenter IPs
-    '--format-sort', 'hasaudiorate,hasvideorate,source,codec:vp9.2,avc1',
     // Add headers to look like a real browser
     '--add-header', 'Origin:https://www.youtube.com',
     '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
