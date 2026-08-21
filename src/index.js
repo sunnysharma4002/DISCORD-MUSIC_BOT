@@ -108,8 +108,82 @@ async function onReady() {
   }
 }
 
+/* Button handler ------------------------------------------------------ */
+async function handleButton(interaction) {
+  if (!interaction.inGuild()) return;
+
+  const player = interaction.client.getPlayer(interaction.guild.id);
+  if (!player || player.destroyed) return;
+
+  const id = interaction.customId;
+
+  switch (id) {
+    case 'player_prev':
+      // Restart current track or go to previous in history
+      if (player.playbackMs > 3000) {
+        player.audioPlayer.stop(true);
+      } else if (player.history.length > 0) {
+        const prev = player.history.pop();
+        if (prev) {
+          player.queue.unshift(prev);
+          if (player.current) player.audioPlayer.stop(true);
+        }
+      }
+      await interaction.deferUpdate();
+      break;
+
+    case 'player_pause':
+      if (!player.current) {
+        await interaction.reply({ content: '❌ Nothing playing.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (player.isPaused) {
+        player.resume();
+      } else {
+        player.pause();
+      }
+      await interaction.deferUpdate();
+      break;
+
+    case 'player_skip':
+      if (!player.current) {
+        await interaction.reply({ content: '❌ Nothing playing.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      player.skip();
+      await interaction.deferUpdate();
+      break;
+
+    case 'player_stop':
+      player.stop();
+      await interaction.deferUpdate();
+      break;
+
+    case 'player_autoplay':
+      player.autoplay = !player.autoplay;
+      await interaction.deferUpdate();
+      break;
+
+    default:
+      break;
+  }
+
+  // Re-send now playing with updated buttons after a short delay
+  // so the button states reflect the new player state
+  setTimeout(() => {
+    if (player.current && !player.destroyed) {
+      player._notifyNowPlaying(player.current);
+    }
+  }, 500);
+}
+
 /* Command dispatch ---------------------------------------------------- */
 client.on('interactionCreate', async (interaction) => {
+  // Button interactions
+  if (interaction.isButton()) {
+    return handleButton(interaction);
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   if (!interaction.inGuild()) {

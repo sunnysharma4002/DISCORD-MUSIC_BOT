@@ -9,13 +9,14 @@ import {
   NoSubscriberBehavior,
   entersState,
 } from '@discordjs/voice';
-import { EmbedBuilder } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
+import { YouTube } from 'youtube-sr';
 
 // Path to the standalone (python-free) yt-dlp fetched by scripts/setup-ytdlp.mjs.
 // Project root is two levels up from src/voice/.
@@ -98,6 +99,18 @@ function antiBotArgs() {
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
 const EMPTY_QUEUE_LEAVE_MS = 120_000; // idle with empty queue → leave
 
+/** Embed color themes. */
+const THEMES = {
+  default: { name: 'Default', color: 0x5865f2 },
+  night: { name: 'Night', color: 0x2b2d31 },
+  fire: { name: 'Fire', color: 0xff4500 },
+  ocean: { name: 'Ocean', color: 0x00b4d8 },
+  forest: { name: 'Forest', color: 0x2d6a4f },
+  rose: { name: 'Rose', color: 0xff6b9d },
+  gold: { name: 'Gold', color: 0xffd700 },
+  void: { name: 'Void', color: 0x000000 },
+};
+
 /**
  * Per-guild music player.
  *
@@ -120,6 +133,8 @@ export class Player {
     this.textChannelId = null;
 
     this.loop = 'off';        // 'off' | 'track' | 'queue'
+    this.autoplay = false;    // auto-search related when queue empties
+    this.theme = 'default';   // embed color theme
     this.destroyed = false;
 
     this._stuckTimer = null;
@@ -380,6 +395,20 @@ export class Player {
 
       if (!next) {
         this.current = null;
+
+        // Autoplay: search for a related track when queue is empty
+        if (this.autoplay && finished) {
+          const related = await this._searchRelated(finished);
+          if (related) {
+            this.current = null;
+            this.enqueue([related]);
+            this._cancelIdleLeave();
+            this._advancing = false;
+            await this._advance();
+            return;
+          }
+        }
+
         this._scheduleIdleLeave();
         return;
       }
@@ -409,6 +438,54 @@ export class Player {
       // Manually continue since no Idle event will fire
       this.current = null;
       await this._advance();
+    }
+  }
+
+  /**
+   * Searches YouTube for a track related to the finished one (autoplay).
+   * Builds query from artist name + "mix" or title keywords.
+   * Returns a youtube-sr Video or null on failure.
+   */
+  async _searchRelated(finished) {
+    try {
+      // Build a related query from the finished track's metadata
+      let query = '';
+      if (finished.author && finished.author !== 'Unknown') {
+        query = `${finished.author} mix`;
+      } else if (finished.title && finished.title !== 'YouTube video') {
+        // Strip common noise words from title for search
+        query = finished.title
+          .replace(/\(.*?\)|\[.*?\]|Official|Music Video|Lyrics|Audio/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 60);
+        if (query) query += ' mix';
+      }
+
+      if (!query) query = `${finished.title || 'music'} mix`;
+
+      const results = await YouTube.search(query, { limit: 10, type: 'video' });
+      if (!Array.isArray(results) || results.length === 0) return null;
+
+      // Pick a random result that isn't the same video
+      const candidates = results.filter(v => v?.id && v.id !== finished.videoId);
+      if (candidates.length === 0) return null;
+
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      return {
+        title: pick.title ?? 'Unknown title',
+        url: pick.url ?? `https://www.youtube.com/watch?v=${pick.id}`,
+        videoId: pick.id,
+        duration: (Number(pick.duration) || 0),
+        isLive: Boolean(pick.live),
+        thumbnail: pick.thumbnail?.url ?? `https://i.ytimg.com/vi/${pick.id}/hqdefault.jpg`,
+        author: pick.channel?.name ?? 'Unknown',
+        source: 'youtube',
+        requestedBy: finished.requestedBy, // keep original requester
+      };
+    } catch (err) {
+      console.warn('[player] autoplay search failed:', err.message);
+      return null;
     }
   }
 
@@ -563,7 +640,35 @@ export class Player {
   _notifyNowPlaying(track) {
     const channel = this.client.channels.cache.get(this.textChannelId);
     if (!channel?.isTextBased()) return;
-    channel.send({ embeds: [this.nowPlayingEmbed()] }).catch(() => {});
+    const embed = this.nowPlayingEmbed();
+    const row = this.controlRow();
+    channel.send({ embeds: [embed], components: [row] }).catch(() => {});
+  }
+
+  /** Playback control buttons attached to now-playing messages. */
+  controlRow() {
+    return new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('player_prev')
+        .setLabel('⏮')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('player_pause')
+        .setLabel(this.isPaused ? '▶' : '⏸')
+        .setStyle(this.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('player_skip')
+        .setLabel('⏭')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('player_stop')
+        .setLabel('⏹')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('player_autoplay')
+        .setLabel(this.autoplay ? '🔁 ON' : '🔁 OFF')
+        .setStyle(this.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
   }
 
   /* ---------------------------------------------------------------- */
@@ -578,8 +683,10 @@ export class Player {
         .setDescription('Nothing is playing right now.');
     }
 
+    const themeColor = this.theme ? THEMES[this.theme]?.color ?? 0x5865f2 : 0x5865f2;
+
     const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
+      .setColor(themeColor)
       .setAuthor({ name: 'Now playing' })
       .setTitle(truncate(t.title, 250))
       .setURL(t.url)
