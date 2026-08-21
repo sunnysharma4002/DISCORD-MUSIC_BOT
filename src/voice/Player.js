@@ -58,6 +58,7 @@ function ytdlpCmd() {
 // Client spoofing helps even without cookies and is always applied.
 let _cookieFileCache; // undefined = not resolved, null = none, string = path
 function resolveCookieFile() {
+  logEnvState();
   if (_cookieFileCache !== undefined) return _cookieFileCache;
 
   if (process.env.YOUTUBE_COOKIE_FILE && existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
@@ -85,6 +86,8 @@ function resolveCookieFile() {
 
 /** Shared yt-dlp args to dodge YouTube's bot check. */
 function antiBotArgs() {
+  const cookies = resolveCookieFile();
+  console.log(`[player] antiBotArgs: cookies=${cookies || 'none'}`);
   const args = [
     // Try multiple player clients — mobile/TV clients are less aggressively checked.
     '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
@@ -96,9 +99,19 @@ function antiBotArgs() {
     // Fake referer to look like embedded player
     '--referer', 'https://www.youtube.com/',
   ];
-  const cookies = resolveCookieFile();
   if (cookies) args.push('--cookies', cookies);
   return args;
+}
+
+// Debug: log env var presence on first call
+let _envLogged = false;
+function logEnvState() {
+  if (_envLogged) return;
+  _envLogged = true;
+  const hasFile = !!process.env.YOUTUBE_COOKIE_FILE;
+  const hasCookies = !!process.env.YOUTUBE_COOKIES;
+  const cookiesLen = process.env.YOUTUBE_COOKIES?.length || 0;
+  console.log(`[player] env check: YOUTUBE_COOKIE_FILE=${hasFile}, YOUTUBE_COOKIES=${hasCookies} (len=${cookiesLen})`);
 }
 
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
