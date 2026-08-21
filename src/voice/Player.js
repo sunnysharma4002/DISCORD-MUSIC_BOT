@@ -872,18 +872,22 @@ export class Player {
       ...(resolveCookieFile() ? [antiBotArgs()] : []),
     ];
 
-    // Build all combinations: try direct first, then with each proxy
+    // Build all combinations: try direct first (quick), then with each proxy
     const allAttempts = [];
 
-    // First try direct (no proxy) with all extractor sets
-    allAttempts.push({ proxy: null, extractorSets, formatSelectors: ['bestaudio/best', 'bestaudio[ext!=webm]/bestaudio'] });
-
-    // Then try with each proxy - but only use direct YouTube extractors (skip Invidious)
+    // Quick direct attempt - only try direct YouTube extractors (skip Invidious, they're all down)
     const directExtractors = extractorSets.slice(invidiousInstances.length); // Skip Invidious instances
+    allAttempts.push({
+      proxy: null,
+      extractorSets: directExtractors.slice(0, 3), // Only first 3 direct extractors
+      formatSelectors: ['bestaudio/best'],
+    });
+
+    // Then try with each proxy
     for (const proxy of proxies) {
       allAttempts.push({
         proxy,
-        extractorSets: directExtractors.slice(0, 5), // Use first 5 direct extractors
+        extractorSets: directExtractors.slice(0, 3), // Use first 3 direct extractors
         formatSelectors: ['bestaudio/best'],
       });
     }
@@ -1025,7 +1029,7 @@ export class Player {
         }
       });
 
-      // Timeout after 45s — Invidious can be slower than direct YouTube
+      // Timeout after 15s per attempt (faster fallback)
       setTimeout(() => {
         if (!resourceCreated) {
           console.warn('[player] timeout waiting for data, killing process');
@@ -1033,7 +1037,7 @@ export class Player {
           try { proc.kill('SIGKILL'); } catch {}
           resolve(null);
         }
-      }, 45000);
+      }, 15000);
     });
   }
 
