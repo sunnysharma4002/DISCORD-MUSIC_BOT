@@ -1,4 +1,29 @@
 import { YouTube } from 'youtube-sr';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { constants as ytdlpConstants } from 'youtube-dl-exec';
+
+const _projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
+
+function getYtdlpBin() {
+  const override = (process.env.YTDLP_CMD || '').trim();
+  let bin, pre;
+  if (override) {
+    const parts = override.split(/\s+/);
+    bin = parts[0];
+    pre = parts.slice(1);
+  } else if (existsSync(_vendoredYtdlp)) {
+    bin = _vendoredYtdlp;
+    pre = [];
+  } else {
+    bin = ytdlpConstants.YOUTUBE_DL_PATH;
+    pre = [];
+  }
+  return { bin, pre };
+}
 
 /**
  * Spotify → YouTube resolution.
@@ -212,6 +237,82 @@ function normaliseVideo(video) {
 }
 
 /**
+ * Fetches playlist metadata using yt-dlp (more reliable than youtube-sr).
+ * Returns { title, entries: [{ title, url, id, duration }] } or null on failure.
+ */
+async function fetchPlaylistViaYtdlp(url) {
+  const { bin, pre } = getYtdlpBin();
+
+  if (!existsSync(bin)) {
+    console.warn('[resolver] yt-dlp binary not found, skipping yt-dlp playlist fetch');
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const args = [
+      ...pre,
+      '-J',
+      '--flat-playlist',
+      '--playlist-items', `0:${MAX_PLAYLIST_TRACKS - 1}`,
+      '--no-warnings',
+      '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
+      url,
+    ];
+
+    let stdout = '';
+    let stderr = '';
+    let timeout;
+
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0 || !stdout.trim()) {
+        console.warn(`[resolver] yt-dlp playlist fetch failed (code ${code}): ${stderr.trim().substring(0, 200)}`);
+        return resolve(null);
+      }
+
+      try {
+        const data = JSON.parse(stdout);
+        if (!data || !data.entries || data.entries.length === 0) {
+          return resolve(null);
+        }
+
+        const entries = data.entries.map((entry) => ({
+          title: entry.title || 'Unknown title',
+          url: entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
+          id: entry.id,
+          duration: entry.duration ? entry.duration * 1000 : 0,
+        })).filter((e) => e.id);
+
+        resolve({
+          title: data.title || 'YouTube playlist',
+          videoCount: data.count || entries.length,
+          entries,
+        });
+      } catch (e) {
+        console.warn('[resolver] yt-dlp playlist JSON parse failed:', e.message);
+        resolve(null);
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      console.warn('[resolver] yt-dlp playlist spawn error:', err.message);
+      resolve(null);
+    });
+
+    timeout = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch {}
+      resolve(null);
+    }, 15000);
+  });
+}
+
+/**
  * Resolves a YouTube URL, a YouTube playlist URL, or a plain search query.
  * Returns { tracks, playlistName }.
  */
@@ -221,10 +322,34 @@ export async function resolveYouTube(rawQuery, requestedBy) {
 
   /* Playlist URL --------------------------------------------------- */
   if (/[?&]list=/.test(query) && isYouTubeURL(query)) {
+    // Try yt-dlp first (more reliable for playlist extraction)
+    const ytdlpResult = await fetchPlaylistViaYtdlp(query);
+    if (ytdlpResult && ytdlpResult.entries.length > 0) {
+      console.log(`[resolver] yt-dlp playlist fetched: ${ytdlpResult.entries.length} tracks from "${ytdlpResult.title}"`);
+      return {
+        tracks: ytdlpResult.entries.map((e) => ({
+          title: e.title,
+          url: e.url,
+          videoId: e.id,
+          duration: e.duration,
+          isLive: false,
+          thumbnail: `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg`,
+          author: 'Unknown',
+          source: 'youtube',
+          requestedBy,
+        })),
+        playlistName: ytdlpResult.title,
+        skipped: 0,
+        truncated: ytdlpResult.videoCount > ytdlpResult.entries.length,
+      };
+    }
+
+    // Fallback to youtube-sr
     try {
       const playlist = await YouTube.getPlaylist(query, { fetchAll: false });
       const videos = (playlist?.videos ?? []).slice(0, MAX_PLAYLIST_TRACKS);
       if (videos.length > 0) {
+        console.log(`[resolver] youtube-sr playlist fallback: ${videos.length} tracks`);
         return {
           tracks: videos.map((v) => ({ ...normaliseVideo(v), requestedBy })),
           playlistName: playlist?.title ?? 'YouTube playlist',
