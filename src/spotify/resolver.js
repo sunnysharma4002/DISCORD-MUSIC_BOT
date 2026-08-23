@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 
-const _projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const _projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
 
 function getYtdlpBin() {
@@ -360,7 +360,9 @@ export async function resolveYouTube(rawQuery, requestedBy) {
     } catch (err) {
       console.warn(`[youtube] playlist fetch failed, falling back: ${err.message}`);
     }
-    // fall through to single-video handling
+
+    // Playlist URL but both methods failed — don't fall through to single-video
+    throw new Error('Could not fetch that YouTube playlist. Make sure it\'s public or unlisted.');
   }
 
   /* Single video URL ---------------------------------------------- */
