@@ -124,7 +124,7 @@ function antiBotArgs() {
   const cookies = resolveCookieFile();
   const args = [
     '--js-runtimes', 'node', // Use Node.js for signature decryption
-    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
+    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web_safari,web_embedded,mweb',
     '--extractor-args', 'youtube:player_skip=hls',
     '--extractor-retries', '5',
     '--retry-sleep', 'extractor:3',
@@ -750,23 +750,40 @@ export class Player {
 
     const strategies = [
       {
-        name: 'android+ios+tv',
+        name: 'android+ios+tv+web',
         args: [...antiBotArgs()],
       },
       {
-        name: 'web-client',
+        name: 'web_safari',
         args: [
           '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=web',
-          '--extractor-args', 'youtube:player_skip=hls',
+          '--extractor-args', 'youtube:player_client=web_safari',
           '--extractor-retries', '5',
-          '--retry-sleep', 'extractor:3',
+          '--no-check-certificate',
           '--referer', 'https://www.youtube.com/',
+        ],
+      },
+      {
+        name: 'web_embedded',
+        args: [
+          '--js-runtimes', 'node',
+          '--extractor-args', 'youtube:player_client=web_embedded',
+          '--extractor-retries', '5',
+          '--no-check-certificate',
+          '--referer', 'https://www.youtube.com/',
+        ],
+      },
+      {
+        name: 'mweb',
+        args: [
+          '--js-runtimes', 'node',
+          '--extractor-args', 'youtube:player_client=mweb',
+          '--extractor-retries', '5',
           '--no-check-certificate',
         ],
       },
       {
-        name: 'android-only',
+        name: 'android',
         args: [
           '--js-runtimes', 'node',
           '--extractor-args', 'youtube:player_client=android',
@@ -775,7 +792,7 @@ export class Player {
         ],
       },
       {
-        name: 'ios-only',
+        name: 'ios',
         args: [
           '--js-runtimes', 'node',
           '--extractor-args', 'youtube:player_client=ios',
@@ -825,7 +842,8 @@ export class Player {
         return result;
       }
 
-      await new Promise(r => setTimeout(r, 1000));
+      // Longer delay between attempts to avoid rate limiting
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     const methods = ['Innertube API', 'play-dl', 'yt-dlp'];
