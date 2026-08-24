@@ -116,35 +116,12 @@ export default {
 
     player.enqueue(tracks);
 
-    // Show nice embed similar to /nowplaying with control buttons
+    // Show loading state - player will send full embed after enrichment
     if (startedEmpty) {
-      // First track - show now playing style embed with controls
-      const t = tracks[0];
-      const embed = new EmbedBuilder().setColor(0x57f287);
-      embed
-        .setAuthor({ name: '🎵 Now Playing' })
-        .setTitle(`🎶 ${t.title.slice(0, 250)}`)
-        .setURL(t.url)
-        .addFields(
-          { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
-          { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
-          { name: '📍 Position', value: 'Playing now', inline: true },
-          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube', inline: true },
-          { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
-        );
-      if (t.thumbnail && t.thumbnail.startsWith('http')) {
-        embed.setThumbnail(t.thumbnail);
-      } else if (t.videoId) {
-        embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg`);
-      }
-
-      const reply = await interaction.editReply({
-        content: '## 🎵 **Now Playing**',
-        embeds: [embed],
-        components: [player.controlRow(), player.controlRow2()],
+      await interaction.editReply({
+        content: `⏳ Loading **${tracks[0].title?.slice(0, 100) || 'track'}**...`,
+        components: [],
       });
-      player.controlPanelMessageId = reply.id;
-      console.log(`[play] control panel created with buttons, message id=${reply.id}`);
     } else {
       // Added to queue - show queue style embed
       const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
@@ -154,7 +131,7 @@ export default {
         const t = tracks[0];
         embed
           .setAuthor({ name: '✅ Added to queue' })
-          .setTitle(`🎶 ${t.title.slice(0, 250)}`)
+          .setTitle(`🎶 ${t.title?.slice(0, 250) || 'Unknown track'}`)
           .setURL(t.url)
           .addFields(
             { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
@@ -175,7 +152,7 @@ export default {
           .setTitle(`📀 ${playlistName ?? 'Playlist'}`.slice(0, 250))
           .setDescription(
             `**${tracks.length}** tracks queued · ${fmt(totalMs)} total\n` +
-            `First up: [${tracks[0].title.slice(0, 80)}](${tracks[0].url})`,
+            `First up: [${tracks[0].title?.slice(0, 80) || 'Unknown'}](${tracks[0].url})`,
           )
           .addFields({ name: '📡 Source', value: sourceLabel, inline: true });
         if (tracks[0].thumbnail && tracks[0].thumbnail.startsWith('http')) {
