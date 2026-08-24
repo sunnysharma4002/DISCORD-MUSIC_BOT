@@ -727,17 +727,13 @@ export class Player {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
     const videoId = track.videoId || extractVideoId(url);
     console.log(`[player] _createResource: "${track.title?.substring(0, 50)}" videoId="${videoId}"`);
+    console.log(`[player] track data: title="${track.title}" author="${track.author}" thumbnail="${track.thumbnail?.substring(0, 60)}" duration=${track.duration}`);
 
-    // Enrich metadata if missing or incomplete
-    const needsEnrichment = !track.duration || !track.author || !track.title ||
-      track.title === 'YouTube video' || track.title === 'Unknown title' ||
-      !track.thumbnail || !track.thumbnail.startsWith('http');
-    if (needsEnrichment) {
-      try {
-        await this._enrichMetadata(track, url);
-      } catch (err) {
-        console.warn('[player] metadata fetch failed:', err.message);
-      }
+    // Always enrich metadata to get the best data from yt-dlp
+    try {
+      await this._enrichMetadata(track, url);
+    } catch (err) {
+      console.warn('[player] metadata fetch failed:', err.message);
     }
 
     // Strategy 1: yt-dlp with multiple client strategies + Node.js JS runtime
