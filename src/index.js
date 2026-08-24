@@ -1,7 +1,7 @@
 process.env.DEBUG = 'discord-voice*';
 
 import { Client, GatewayIntentBits, Collection, ActivityType, MessageFlags } from 'discord.js';
-import { generateDependencyReport } from '@discordjs/voice';
+import { generateDependencyReport, AudioPlayerStatus } from '@discordjs/voice';
 import { Player } from './voice/Player.js';
 import { registerCommands } from './commands/handler.js';
 import dotenv from 'dotenv';
@@ -163,23 +163,64 @@ async function handleButton(interaction) {
       player.autoplay = !player.autoplay;
       console.log(`[player] autoplay toggled: ${player.autoplay}`);
       await interaction.deferUpdate();
+      await player.updateControlPanel();
+      break;
 
-      // Update the control panel to reflect the new autoplay state
-      if (player.controlPanelMessageId) {
-        const channel = player.client.channels.cache.get(player.textChannelId);
-        if (channel?.isTextBased()) {
-          const embed = player.nowPlayingEmbed();
-          const row = player.controlRow();
-          channel.messages.edit(player.controlPanelMessageId, {
-            content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
-            embeds: [embed],
-            components: [row],
-          }).then(() => {
-            console.log('[player] control panel updated after autoplay toggle');
-          }).catch((err) => {
-            console.warn(`[player] autoplay panel update failed: ${err.code} ${err.message}`);
-          });
-        }
+    case 'player_loop':
+      // Cycle: off → track → queue → off
+      if (player.loop === 'off') {
+        player.loop = 'track';
+      } else if (player.loop === 'track') {
+        player.loop = 'queue';
+      } else {
+        player.loop = 'off';
+      }
+      console.log(`[player] loop set to: ${player.loop}`);
+      await interaction.deferUpdate();
+      await player.updateControlPanel();
+      break;
+
+    case 'player_shuffle':
+      if (player.queue.length < 2) {
+        await interaction.reply({ content: '❌ Need at least 2 tracks in queue to shuffle.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      player.shuffle();
+      console.log('[player] queue shuffled');
+      await interaction.deferUpdate();
+      await player.updateControlPanel();
+      break;
+
+    case 'player_queue':
+      await interaction.deferUpdate();
+      // Send queue embed as ephemeral reply
+      const queueEmbed = player.queueEmbed(0, 10);
+      await interaction.followUp({ embeds: [queueEmbed], flags: MessageFlags.Ephemeral });
+      break;
+
+    case 'player_volume_up':
+      if (player.audioPlayer.state.status === AudioPlayerStatus.Playing) {
+        const vol = player.audioPlayer.state.resource.volume?.volume ?? 1;
+        const newVol = Math.min(vol + 0.1, 2);
+        player.audioPlayer.state.resource.volume?.setVolume(newVol);
+        console.log(`[player] volume up: ${Math.round(newVol * 100)}%`);
+        await interaction.deferUpdate();
+        await player.updateControlPanel();
+      } else {
+        await interaction.reply({ content: '❌ Nothing playing.', flags: MessageFlags.Ephemeral });
+      }
+      break;
+
+    case 'player_volume_down':
+      if (player.audioPlayer.state.status === AudioPlayerStatus.Playing) {
+        const vol = player.audioPlayer.state.resource.volume?.volume ?? 1;
+        const newVol = Math.max(vol - 0.1, 0.1);
+        player.audioPlayer.state.resource.volume?.setVolume(newVol);
+        console.log(`[player] volume down: ${Math.round(newVol * 100)}%`);
+        await interaction.deferUpdate();
+        await player.updateControlPanel();
+      } else {
+        await interaction.reply({ content: '❌ Nothing playing.', flags: MessageFlags.Ephemeral });
       }
       break;
 
@@ -196,20 +237,7 @@ async function handleButton(interaction) {
 
     // Update the control panel if it exists
     if (player.controlPanelMessageId && player.current) {
-      const channel = player.client.channels.cache.get(player.textChannelId);
-      if (channel?.isTextBased()) {
-        const embed = player.nowPlayingEmbed();
-        const row = player.controlRow();
-        channel.messages.edit(player.controlPanelMessageId, {
-          content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
-          embeds: [embed],
-          components: [row],
-        }).then(() => {
-          console.log('[player] control panel updated after button press');
-        }).catch((err) => {
-          console.warn(`[player] control panel update failed: ${err.code} ${err.message}`);
-        });
-      }
+      await player.updateControlPanel();
     }
   }, updateDelay);
 }

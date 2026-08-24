@@ -903,38 +903,29 @@ export class Player {
   _notifyNowPlaying(track) {
     const channel = this.client.channels.cache.get(this.textChannelId);
     if (!channel?.isTextBased()) return;
-    const embed = this.nowPlayingEmbed();
-    const row = this.controlRow();
 
-    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}" controlPanel=${this.controlPanelMessageId}`);
-
-    // Update existing control panel if it exists
+    // Delete old control panel so users always see a fresh now-playing message
     if (this.controlPanelMessageId) {
-      channel.messages.edit(this.controlPanelMessageId, {
-        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
-        embeds: [embed],
-        components: [row],
-      }).then(() => {
-        console.log(`[player] control panel updated`);
-      }).catch((err) => {
-        console.warn(`[player] control panel edit failed: ${err.code} ${err.message}`);
-        if (err?.code === 10008) {
-          this.controlPanelMessageId = null;
-        }
-      });
-    } else {
-      // No control panel - send a new message
-      channel.send({
-        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
-        embeds: [embed],
-        components: [row],
-      }).then((msg) => {
-        this.controlPanelMessageId = msg.id;
-        console.log(`[player] control panel sent, id=${msg.id}`);
-      }).catch((err) => {
-        console.warn(`[player] control panel send failed: ${err.code} ${err.message}`);
-      });
+      channel.messages.delete(this.controlPanelMessageId).catch(() => {});
+      this.controlPanelMessageId = null;
     }
+
+    const embed = this.nowPlayingEmbed();
+    const row1 = this.controlRow();
+    const row2 = this.controlRow2();
+
+    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}"`);
+
+    channel.send({
+      content: '## 🎵 **Now Playing**',
+      embeds: [embed],
+      components: [row1, row2],
+    }).then((msg) => {
+      this.controlPanelMessageId = msg.id;
+      console.log(`[player] now-playing message sent, id=${msg.id}`);
+    }).catch((err) => {
+      console.warn(`[player] now-playing send failed: ${err.code} ${err.message}`);
+    });
   }
 
   /** Update the control panel with current state (progress, buttons, etc.) */
@@ -945,16 +936,17 @@ export class Player {
     if (!channel?.isTextBased()) return;
 
     const embed = this.nowPlayingEmbed();
-    const row = this.controlRow();
+    const row1 = this.controlRow();
+    const row2 = this.controlRow2();
 
     console.log(`[player] updateControlPanel called for message ${this.controlPanelMessageId}`);
 
     try {
       // Edit the existing message
       await channel.messages.edit(this.controlPanelMessageId, {
-        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
+        content: '## 🎵 **Now Playing**',
         embeds: [embed],
-        components: [row],
+        components: [row1, row2],
       });
       console.log('[player] control panel edit succeeded');
     } catch (err) {
@@ -993,24 +985,61 @@ export class Player {
     return new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId('player_prev')
+        .setEmoji('⏮️')
         .setLabel('Previous')
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId('player_pause')
+        .setEmoji(this.isPaused ? '▶️' : '⏸️')
         .setLabel(this.isPaused ? 'Play' : 'Pause')
         .setStyle(this.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId('player_skip')
+        .setEmoji('⏭️')
         .setLabel('Skip')
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId('player_stop')
+        .setEmoji('⏹️')
         .setLabel('Stop')
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
         .setCustomId('player_autoplay')
-        .setLabel(this.autoplay ? 'Autoplay: ON' : 'Autoplay: OFF')
+        .setEmoji(this.autoplay ? '🔁' : '⏭️')
+        .setLabel(this.autoplay ? 'Auto: ON' : 'Auto: OFF')
         .setStyle(this.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+  }
+
+  /** Second row for loop and shuffle controls. */
+  controlRow2() {
+    return new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('player_loop')
+        .setEmoji(this.loop === 'track' ? '🔂' : this.loop === 'queue' ? '🔁' : '🔀')
+        .setLabel(this.loop === 'track' ? 'Loop: Track' : this.loop === 'queue' ? 'Loop: Queue' : 'Loop: Off')
+        .setStyle(this.loop === 'off' ? ButtonStyle.Secondary : ButtonStyle.Primary)
+        .setDisabled(this.loop === 'off' && this.queue.length === 0),
+      new ButtonBuilder()
+        .setCustomId('player_shuffle')
+        .setEmoji('🔀')
+        .setLabel('Shuffle')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('player_queue')
+        .setEmoji('📋')
+        .setLabel('Queue')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('player_volume_up')
+        .setEmoji('🔊')
+        .setLabel('Volume +')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('player_volume_down')
+        .setEmoji('🔉')
+        .setLabel('Volume -')
+        .setStyle(ButtonStyle.Secondary),
     );
   }
 
@@ -1023,60 +1052,82 @@ export class Player {
     if (!t) {
       return new EmbedBuilder()
         .setColor(0x2b2d31)
-        .setDescription('Nothing is playing right now.');
+        .setDescription('🎵 Nothing is playing right now. Use `/play` to start.');
     }
 
     const themeColor = this.theme ? THEMES[this.theme]?.color ?? 0x5865f2 : 0x5865f2;
     const playback = this.playbackMs;
     const duration = t.duration || 0;
 
-    console.log(`[player] nowPlayingEmbed: title="${t.title?.substring(0, 40)}" duration=${fmt(duration)} playback=${fmt(playback)} thumbnail=${!!t.thumbnail}`);
-
     const embed = new EmbedBuilder()
       .setColor(themeColor)
-      .setAuthor({ name: 'Now playing' })
-      .setTitle(truncate(t.title, 250))
+      .setAuthor({
+        name: t.source === 'spotify' ? 'Spotify → YouTube' : 'YouTube',
+        iconURL: t.source === 'spotify'
+          ? 'https://cdn-icons-png.flaticon.com/512/174/174869.png'
+          : 'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
+      })
+      .setTitle(`🎶 ${truncate(t.title, 200)}`)
       .setURL(t.url)
-      .addFields(
-        { name: 'Channel', value: truncate(t.author ?? 'Unknown', 100), inline: true },
-        { name: 'Requested by', value: t.requestedBy ? `<@${t.requestedBy}>` : 'Unknown', inline: true },
-        { name: 'Source', value: t.source === 'spotify' ? 'Spotify → YouTube' : 'YouTube', inline: true },
-      );
+      .addFields({
+        name: '🎤 Artist',
+        value: truncate(t.author ?? 'Unknown', 100),
+        inline: true,
+      })
+      .addFields({
+        name: '👤 Requested by',
+        value: t.requestedBy ? `<@${t.requestedBy}>` : 'Unknown',
+        inline: true,
+      })
+      .addFields({
+        name: '⏱ Duration',
+        value: t.isLive ? '🔴 **LIVE**' : fmt(duration),
+        inline: true,
+      });
 
-    if (t.isLive) {
-      embed.addFields({ name: 'Duration', value: '🔴 Live', inline: false });
-    } else if (duration > 0) {
-      const bar = progressBar(playback, duration);
+    if (!t.isLive && duration > 0) {
+      const bar = progressBar(playback, duration, 20);
       embed.addFields({
-        name: 'Progress',
-        value: `${bar}\n\`${fmt(playback)} / ${fmt(duration)}\``,
+        name: '\u200b',
+        value: `${bar}\n**${fmt(playback)}** / **${fmt(duration)}**`,
         inline: false,
       });
-      console.log(`[player] progress bar: ${bar} ${fmt(playback)}/${fmt(duration)}`);
-    } else {
-      console.log(`[player] no duration for progress bar, duration=${duration}`);
+    } else if (t.isLive) {
+      embed.addFields({
+        name: '\u200b',
+        value: '🔴 **LIVE STREAM** — no duration available',
+        inline: false,
+      });
     }
 
     if (t.spotifyTitle) {
-      embed.setFooter({ text: `Spotify: ${truncate(t.spotifyTitle, 200)}` });
+      embed.setFooter({ text: `🎧 Originally from Spotify: ${truncate(t.spotifyTitle, 150)}` });
+    } else {
+      const loopLabel = this.loop === 'track' ? '🔂 Track' : this.loop === 'queue' ? '🔁 Queue' : '🔀 None';
+      const queueInfo = `Queue: ${this.queue.length} track${this.queue.length !== 1 ? 's' : ''} up next`;
+      embed.setFooter({ text: `${loopLabel} · ${queueInfo}` });
     }
 
     if (t.thumbnail) {
       embed.setThumbnail(t.thumbnail);
-      console.log(`[player] thumbnail set: ${t.thumbnail.substring(0, 60)}...`);
     }
+
+    embed.setTimestamp(new Date());
 
     return embed;
   }
 
   queueEmbed(page = 0, pageSize = 10) {
-    const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Queue');
+    const embed = new EmbedBuilder()
+      .setColor(this.theme ? THEMES[this.theme]?.color ?? 0x5865f2 : 0x5865f2)
+      .setTitle('📋 Queue')
+      .setTimestamp(new Date());
 
     const lines = [];
 
     if (this.current) {
       lines.push(
-        `**Now playing**\n[${truncate(this.current.title, 70)}](${this.current.url}) · ` +
+        `**▶️ Now playing**\n[${truncate(this.current.title, 70)}](${this.current.url}) · ` +
         `${this.current.isLive ? '🔴 Live' : fmt(this.current.duration)}\n`
       );
     }
@@ -1094,18 +1145,19 @@ export class Player {
 
     lines.push('**Up next**');
     slice.forEach((t, i) => {
+      const icon = t.isLive ? '🔴' : '🎵';
       lines.push(
-        `\`${start + i + 1}.\` [${truncate(t.title, 60)}](${t.url}) · ` +
+        `\`${start + i + 1}.\` ${icon} [${truncate(t.title, 55)}](${t.url}) · ` +
         `${t.isLive ? '🔴 Live' : fmt(t.duration)} · <@${t.requestedBy}>`
       );
     });
 
     const totalMs = this.queue.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
+    const loopLabel = this.loop === 'track' ? '🔂' : this.loop === 'queue' ? '🔁' : '🔀';
     embed.setDescription(lines.join('\n')).setFooter({
       text:
-        `Page ${safePage + 1}/${totalPages} · ${this.queue.length} track${this.queue.length === 1 ? '' : 's'}` +
-        ` · ${fmt(totalMs)} remaining` +
-        (this.loop !== 'off' ? ` · loop: ${this.loop}` : ''),
+        `${loopLabel} Page ${safePage + 1}/${totalPages} · ${this.queue.length} track${this.queue.length === 1 ? '' : 's'}` +
+        ` · ${fmt(totalMs)} remaining`,
     });
 
     return embed;
@@ -1131,7 +1183,9 @@ function progressBar(currentMs, totalMs, width = 18) {
   if (!totalMs || totalMs <= 0) return '─'.repeat(width);
   const ratio = Math.min(Math.max(currentMs / totalMs, 0), 1);
   const pos = Math.round(ratio * (width - 1));
-  return '─'.repeat(pos) + '🔵' + '─'.repeat(width - 1 - pos);
+  const empty = '░';
+  const filled = '█';
+  return empty.repeat(pos) + filled + empty.repeat(width - 1 - pos);
 }
 
 function truncate(str, max) {

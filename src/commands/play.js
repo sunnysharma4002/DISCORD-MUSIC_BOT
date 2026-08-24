@@ -116,40 +116,14 @@ export default {
 
     player.enqueue(tracks);
 
-    // Send control panel message FIRST (before starting playback)
-    // so _notifyNowPlaying can update it
+    // Simple confirmation — the actual now-playing card is sent by the player
+    // when playback starts, and replaced on every track change.
     if (startedEmpty) {
-      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
-      const embed = new EmbedBuilder().setColor(0x57f287);
-      embed
-        .setAuthor({ name: 'Playing now' })
-        .setTitle(tracks[0].title.slice(0, 250))
-        .setURL(tracks[0].url)
-        .addFields(
-          { name: 'Duration', value: tracks[0].isLive ? '🔴 Live' : fmt(tracks[0].duration), inline: true },
-          { name: 'Position', value: 'Playing now', inline: true },
-          { name: 'Source', value: sourceLabel, inline: true },
-        );
-      if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
-
-      const reply = await interaction.editReply({
-        content: '## 🎵 **Music Player Dashboard**\nUse the buttons below to control playback.',
-        embeds: [embed],
-        components: [player.controlRow()],
+      await interaction.editReply({
+        content: `⏳ Joining and loading **${tracks[0].title.slice(0, 100)}**...`,
+        components: [],
       });
-      player.controlPanelMessageId = reply.id;
-      console.log(`[player] control panel set to message ${reply.id} before playback`);
-    }
-
-    try {
-      await player.start();
-    } catch (err) {
-      console.error('[play] start failed:', err);
-      return interaction.editReply(`❌ Failed to start playback: ${err.message}`);
-    }
-
-    /* -- Confirmation embed (if not already sent above) ------------ */
-    if (!startedEmpty) {
+    } else {
       const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
       const embed = new EmbedBuilder().setColor(0x57f287);
 
@@ -161,11 +135,7 @@ export default {
           .setURL(t.url)
           .addFields(
             { name: 'Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
-            {
-              name: 'Position',
-              value: `#${player.queue.length}`,
-              inline: true,
-            },
+            { name: 'Position', value: `#${player.queue.length}`, inline: true },
             { name: 'Source', value: sourceLabel, inline: true },
           );
         if (t.thumbnail) embed.setThumbnail(t.thumbnail);
@@ -187,7 +157,14 @@ export default {
       if (truncated) notes.push('list truncated to the first 60 tracks');
       if (notes.length > 0) embed.setFooter({ text: notes.join(' · ') });
 
-      return interaction.editReply({ embeds: [embed] });
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    try {
+      await player.start();
+    } catch (err) {
+      console.error('[play] start failed:', err);
+      return interaction.editReply(`❌ Failed to start playback: ${err.message}`);
     }
 
     return;
