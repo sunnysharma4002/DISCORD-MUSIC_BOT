@@ -116,9 +116,9 @@ export default {
 
     player.enqueue(tracks);
 
-    // Show nice embed similar to /nowplaying
+    // Show nice embed similar to /nowplaying with control buttons
     if (startedEmpty) {
-      // First track - show now playing style embed
+      // First track - show now playing style embed with controls
       const t = tracks[0];
       const embed = new EmbedBuilder().setColor(0x57f287);
       embed
@@ -138,10 +138,13 @@ export default {
         embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg`);
       }
 
-      await interaction.editReply({
+      const reply = await interaction.editReply({
         content: '## 🎵 **Now Playing**',
         embeds: [embed],
+        components: [player.controlRow(), player.controlRow2()],
       });
+      player.controlPanelMessageId = reply.id;
+      console.log(`[play] control panel created with buttons, message id=${reply.id}`);
     } else {
       // Added to queue - show queue style embed
       const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
