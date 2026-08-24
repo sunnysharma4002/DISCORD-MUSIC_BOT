@@ -18,57 +18,6 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import playDlPkg from 'play-dl';
-
-const { stream: playDlStream, stream_from_info: playDlStreamFromInfo, video_info: playDlVideoInfo } = playDlPkg;
-
-// YouTube Innertube API client for direct stream URL extraction.
-// This bypasses yt-dlp and uses YouTube's internal player API directly.
-const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player';
-const INNERTUBE_CLIENTS = [
-  {
-    name: 'WEB',
-    context: {
-      clientName: 'WEB',
-      clientVersion: '2.20240311.08.00',
-      thirdParty: { embedUrl: 'https://google.com' },
-    },
-  },
-  {
-    name: 'WEB_EMBEDDED_PLAYER',
-    context: {
-      clientName: 'WEB_EMBEDDED_PLAYER',
-      clientVersion: '2.20240311.08.00',
-      thirdParty: { embedUrl: 'https://youtube.com' },
-    },
-  },
-  {
-    name: 'ANDROID',
-    context: {
-      clientName: 'ANDROID',
-      clientVersion: '19.29.37',
-      androidSdkVersion: 33,
-      userAgent: 'com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip',
-    },
-  },
-  {
-    name: 'IOS',
-    context: {
-      clientName: 'IOS',
-      clientVersion: '19.29.1',
-      deviceModel: 'iPhone16,2',
-      userAgent: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)',
-    },
-  },
-  {
-    name: 'TV_EMBEDDED',
-    context: {
-      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-      clientVersion: '2.0',
-      thirdParty: { embedUrl: 'https://www.youtube.com' },
-    },
-  },
-];
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -83,172 +32,6 @@ function extractVideoId(url) {
     if (m) return m[1];
   }
   return null;
-}
-
-/** Fetch stream URL via YouTube Innertube API. */
-async function fetchInnertubeStream(videoId, clientConfig) {
-  const body = {
-    context: {
-      client: {
-        ...clientConfig.context,
-        hl: 'en',
-        gl: 'US',
-      },
-    },
-    videoId,
-    contentCheckOk: true,
-    racyCheckOk: true,
-  };
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'User-Agent': clientConfig.context?.userAgent ||
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'X-Youtube-Client-Name': '1',
-    'X-Youtube-Client-Version': clientConfig.context?.clientVersion || '2.20240311.08.00',
-  };
-
-  const res = await fetch(INNERTUBE_API_URL + '?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Innertube HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-
-  // Check for error responses
-  if (data.playabilityStatus?.status === 'LOGIN_REQUIRED') {
-    throw new Error('LOGIN_REQUIRED: ' + (data.playabilityStatus?.reason || 'authentication needed'));
-  }
-  if (data.playabilityStatus?.status === 'AGE_CHECK_REQUIRED') {
-    throw new Error('AGE_CHECK_REQUIRED: ' + (data.playabilityStatus?.reason || 'age verification needed'));
-  }
-  if (data.playabilityStatus?.status === 'ERROR') {
-    throw new Error(data.playabilityStatus?.reason || 'unknown error');
-  }
-
-  // Extract streaming data
-  const streamingData = data.streamingData;
-  if (!streamingData) {
-    throw new Error('No streaming data in response');
-  }
-
-  // Prefer audio-only formats
-  const formats = [
-    ...(streamingData.formats || []),
-    ...(streamingData.adaptiveFormats || []),
-  ];
-
-  const audioFormats = formats.filter(f =>
-    f.mimeType?.includes('audio') && f.url
-  );
-
-  if (audioFormats.length > 0) {
-    // Sort by bitrate (highest first)
-    audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    return {
-      url: audioFormats[0].url,
-      mimeType: audioFormats[0].mimeType,
-      bitrate: audioFormats[0].bitrate,
-      client: clientConfig.name,
-    };
-  }
-
-  // Fallback to video+audio combined formats
-  const videoFormats = formats.filter(f => f.url);
-  if (videoFormats.length > 0) {
-    return {
-      url: videoFormats[0].url,
-      mimeType: videoFormats[0].mimeType,
-      bitrate: videoFormats[0].bitrate,
-      client: clientConfig.name,
-    };
-  }
-
-  // Check for signatureCipher (needs decryption)
-  const cipherFormats = formats.filter(f => f.signatureCipher);
-  if (cipherFormats.length > 0) {
-    throw new Error('CIPHER: signature decryption not supported (use yt-dlp instead)');
-  }
-
-  throw new Error('No playable stream found');
-}
-
-/** Create audio resource from Innertube stream URL. */
-async function createInnertubeResource(videoId, track) {
-  let lastError = '';
-
-  for (const client of INNERTUBE_CLIENTS) {
-    try {
-      console.log(`[innertube] trying ${client.name} client...`);
-      const stream = await fetchInnertubeStream(videoId, client);
-      console.log(`[innertube] SUCCESS via ${client.name}: ${stream.mimeType?.split(';')[0]} ${stream.bitrate}bps`);
-
-      // Create a stream from the URL
-      const { get } = await import('node:https');
-      const { PassThrough } = await import('node:stream');
-
-      return new Promise((resolve, reject) => {
-        const pass = new PassThrough({ highWaterMark: 1024 * 1024 });
-        let gotData = false;
-
-        const req = get(stream.url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Referer': 'https://www.youtube.com/',
-          },
-        }, (res) => {
-          if (res.statusCode !== 200) {
-            reject(new Error(`Stream HTTP ${res.statusCode}`));
-            pass.destroy();
-            return;
-          }
-
-          res.on('data', (chunk) => {
-            gotData = true;
-            pass.write(chunk);
-          });
-
-          res.on('end', () => {
-            pass.end();
-          });
-
-          res.on('error', (err) => {
-            pass.destroy(err);
-          });
-        });
-
-        req.on('error', (err) => {
-          if (!gotData) reject(err);
-        });
-
-        req.setTimeout(15000, () => {
-          if (!gotData) {
-            req.destroy();
-            reject(new Error('Stream timeout'));
-          }
-        });
-
-        const resource = createAudioResource(pass, {
-          inputType: StreamType.Arbitrary,
-          inlineVolume: true,
-          metadata: track,
-        });
-
-        this._activeProc = { kill: () => { try { req.destroy(); pass.destroy(); } catch {} } };
-        resolve(resource);
-      });
-    } catch (err) {
-      lastError = err.message;
-      console.warn(`[innertube] ${client.name} failed: ${err.message?.substring(0, 200)}`);
-    }
-  }
-
-  throw new Error(`Innertube all clients failed: ${lastError}`);
 }
 
 // Path to the standalone (python-free) yt-dlp fetched by scripts/setup-ytdlp.mjs.
@@ -934,9 +717,9 @@ export class Player {
   }
 
   /**
-   * Builds an AudioResource for a track by streaming audio.
-   * Primary: play-dl (Innertube API with automatic client rotation).
-   * Fallback: yt-dlp with multiple player client strategies.
+   * Builds an AudioResource for a track by streaming audio via yt-dlp.
+   * Uses Node.js JS runtime for signature decryption (--js-runtimes node).
+   * Tries multiple player clients (android, ios, tv_embedded, web).
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
@@ -952,67 +735,9 @@ export class Player {
       }
     }
 
-    // Strategy 1: Direct Innertube API (fastest, no external binary)
-    if (videoId) {
-      try {
-        console.log('[player] trying Innertube API...');
-        const resource = await createInnertubeResource.call(this, videoId, track);
-        if (resource) {
-          console.log('[player] SUCCESS via Innertube API!');
-          return resource;
-        }
-      } catch (err) {
-        console.warn('[player] Innertube failed:', err.message?.substring(0, 200));
-      }
-    }
-
-    // Strategy 2: play-dl (Innertube API with auto client rotation)
-    try {
-      console.log('[player] trying play-dl...');
-      const resource = await this._streamViaPlayDl(url, track);
-      if (resource) {
-        console.log('[player] SUCCESS via play-dl!');
-        return resource;
-      }
-    } catch (err) {
-      console.warn('[player] play-dl failed:', err.message?.substring(0, 200));
-    }
-
-    // Strategy 3: yt-dlp with multiple client strategies
-    console.log('[player] falling back to yt-dlp...');
+    // Strategy 1: yt-dlp with multiple client strategies + Node.js JS runtime
+    console.log('[player] using yt-dlp with Node.js JS runtime...');
     return this._streamViaYtdlp(track, url);
-  }
-
-  /** Stream audio using play-dl (Innertube API). */
-  async _streamViaPlayDl(url, track) {
-    return new Promise((resolve, reject) => {
-      try {
-        // play-dl stream() returns a YouTubeStream object with a .stream property
-        playDlStream(url, { quality: 0 }).then((ytStream) => {
-          if (!ytStream || !ytStream.stream) {
-            console.warn('[play-dl] no stream returned');
-            resolve(null);
-            return;
-          }
-
-          console.log(`[play-dl] stream type: ${ytStream.type}`);
-
-          const resource = createAudioResource(ytStream.stream, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: true,
-            metadata: track,
-          });
-
-          this._activeProc = { kill: () => { try { ytStream.stream.destroy(); } catch {} } };
-          resolve(resource);
-        }).catch((err) => {
-          console.warn('[play-dl] stream error:', err.message?.substring(0, 300));
-          resolve(null);
-        });
-      } catch (err) {
-        reject(err);
-      }
-    });
   }
 
   /** Stream audio using yt-dlp with multiple player client strategies. */
