@@ -116,40 +116,70 @@ export default {
 
     player.enqueue(tracks);
 
-    // Simple confirmation — the actual now-playing card is sent by the player
-    // when playback starts, and replaced on every track change.
+    // Show nice embed similar to /nowplaying
     if (startedEmpty) {
+      // First track - show now playing style embed
+      const t = tracks[0];
+      const embed = new EmbedBuilder().setColor(0x57f287);
+      embed
+        .setAuthor({ name: '🎵 Now Playing' })
+        .setTitle(`🎶 ${t.title.slice(0, 250)}`)
+        .setURL(t.url)
+        .addFields(
+          { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
+          { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
+          { name: '📍 Position', value: 'Playing now', inline: true },
+          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube', inline: true },
+          { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
+        );
+      if (t.thumbnail && t.thumbnail.startsWith('http')) {
+        embed.setThumbnail(t.thumbnail);
+      } else if (t.videoId) {
+        embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg`);
+      }
+
       await interaction.editReply({
-        content: `⏳ Joining and loading **${tracks[0].title.slice(0, 100)}**...`,
-        components: [],
+        content: '## 🎵 **Now Playing**',
+        embeds: [embed],
       });
     } else {
+      // Added to queue - show queue style embed
       const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
       const embed = new EmbedBuilder().setColor(0x57f287);
 
       if (tracks.length === 1) {
         const t = tracks[0];
         embed
-          .setAuthor({ name: 'Added to queue' })
-          .setTitle(t.title.slice(0, 250))
+          .setAuthor({ name: '✅ Added to queue' })
+          .setTitle(`🎶 ${t.title.slice(0, 250)}`)
           .setURL(t.url)
           .addFields(
-            { name: 'Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
-            { name: 'Position', value: `#${player.queue.length}`, inline: true },
-            { name: 'Source', value: sourceLabel, inline: true },
+            { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
+            { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
+            { name: '📍 Position', value: `#${player.queue.length}`, inline: true },
+            { name: '📡 Source', value: sourceLabel, inline: true },
+            { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
           );
-        if (t.thumbnail) embed.setThumbnail(t.thumbnail);
+        if (t.thumbnail && t.thumbnail.startsWith('http')) {
+          embed.setThumbnail(t.thumbnail);
+        } else if (t.videoId) {
+          embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg`);
+        }
       } else {
         const totalMs = tracks.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
         embed
-          .setAuthor({ name: 'Added to queue' })
-          .setTitle((playlistName ?? 'Playlist').slice(0, 250))
+          .setAuthor({ name: '✅ Added to queue' })
+          .setTitle(`📀 ${playlistName ?? 'Playlist'}`.slice(0, 250))
           .setDescription(
             `**${tracks.length}** tracks queued · ${fmt(totalMs)} total\n` +
             `First up: [${tracks[0].title.slice(0, 80)}](${tracks[0].url})`,
           )
-          .addFields({ name: 'Source', value: sourceLabel, inline: true });
-        if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
+          .addFields({ name: '📡 Source', value: sourceLabel, inline: true });
+        if (tracks[0].thumbnail && tracks[0].thumbnail.startsWith('http')) {
+          embed.setThumbnail(tracks[0].thumbnail);
+        } else if (tracks[0].videoId) {
+          embed.setThumbnail(`https://i.ytimg.com/vi/${tracks[0].videoId}/hqdefault.jpg`);
+        }
       }
 
       const notes = [];
