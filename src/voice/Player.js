@@ -18,7 +18,9 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import { play as playDl } from 'play-dl';
+import playDlPkg from 'play-dl';
+
+const { stream: playDlStream, stream_from_info: playDlStreamFromInfo, video_info: playDlVideoInfo } = playDlPkg;
 
 // YouTube Innertube API client for direct stream URL extraction.
 // This bypasses yt-dlp and uses YouTube's internal player API directly.
@@ -986,7 +988,7 @@ export class Player {
     return new Promise((resolve, reject) => {
       try {
         // play-dl stream() returns a YouTubeStream object with a .stream property
-        playDl.stream(url, { quality: 0 }).then((ytStream) => {
+        playDlStream(url, { quality: 0 }).then((ytStream) => {
           if (!ytStream || !ytStream.stream) {
             console.warn('[play-dl] no stream returned');
             resolve(null);
