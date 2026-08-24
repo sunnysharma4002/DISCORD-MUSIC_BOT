@@ -1103,41 +1103,28 @@ export class Player {
     const channel = this.client.channels.cache.get(this.textChannelId);
     if (!channel?.isTextBased()) return;
 
+    // Delete old control panel so users see a fresh now-playing message for each track
+    if (this.controlPanelMessageId) {
+      channel.messages.delete(this.controlPanelMessageId).catch(() => {});
+      this.controlPanelMessageId = null;
+    }
+
     const embed = this.nowPlayingEmbed();
     const row1 = this.controlRow();
     const row2 = this.controlRow2();
 
-    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}" controlPanel=${this.controlPanelMessageId}`);
+    console.log(`[player] _notifyNowPlaying: sending new message for "${track?.title?.substring(0, 40)}"`);
 
-    // If control panel already exists (from /play), update it
-    if (this.controlPanelMessageId) {
-      console.log(`[player] updating existing control panel ${this.controlPanelMessageId}`);
-      channel.messages.edit(this.controlPanelMessageId, {
-        content: '## 🎵 **Now Playing**',
-        embeds: [embed],
-        components: [row1, row2],
-      }).then(() => {
-        console.log('[player] control panel updated for now playing');
-      }).catch((err) => {
-        console.warn(`[player] control panel update failed: ${err.code} ${err.message}`);
-        if (err?.code === 10008) {
-          this.controlPanelMessageId = null;
-        }
-      });
-    } else {
-      // No control panel - send a new one
-      console.log('[player] sending new control panel message');
-      channel.send({
-        content: '## 🎵 **Now Playing**',
-        embeds: [embed],
-        components: [row1, row2],
-      }).then((msg) => {
-        this.controlPanelMessageId = msg.id;
-        console.log(`[player] now-playing message sent, id=${msg.id}`);
-      }).catch((err) => {
-        console.warn(`[player] now-playing send failed: ${err.code} ${err.message}`);
-      });
-    }
+    channel.send({
+      content: '## 🎵 **Now Playing**',
+      embeds: [embed],
+      components: [row1, row2],
+    }).then((msg) => {
+      this.controlPanelMessageId = msg.id;
+      console.log(`[player] now-playing message sent, id=${msg.id}`);
+    }).catch((err) => {
+      console.warn(`[player] now-playing send failed: ${err.code} ${err.message}`);
+    });
   }
 
   /** Update the control panel with current state (progress, buttons, etc.) */
