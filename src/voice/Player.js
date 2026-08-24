@@ -607,7 +607,9 @@ export class Player {
       console.log(`[player] audioPlayer state after play: ${this.audioPlayer.state.status}`);
       this._startStuckTimer(track);
       this._cancelIdleLeave();
+      console.log(`[player] controlPanelMessageId before progress: ${this.controlPanelMessageId}`);
       this._startProgressUpdates();
+      console.log(`[player] calling _notifyNowPlaying for "${track.title?.substring(0, 40)}"`);
       this._notifyNowPlaying(track);
     } catch (err) {
       console.error(`[player] failed to stream "${track.title}":`, err.message);
@@ -1101,28 +1103,41 @@ export class Player {
     const channel = this.client.channels.cache.get(this.textChannelId);
     if (!channel?.isTextBased()) return;
 
-    // Delete old control panel so users always see a fresh now-playing message
-    if (this.controlPanelMessageId) {
-      channel.messages.delete(this.controlPanelMessageId).catch(() => {});
-      this.controlPanelMessageId = null;
-    }
-
     const embed = this.nowPlayingEmbed();
     const row1 = this.controlRow();
     const row2 = this.controlRow2();
 
-    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}"`);
+    console.log(`[player] _notifyNowPlaying: "${track?.title?.substring(0, 40)}" controlPanel=${this.controlPanelMessageId}`);
 
-    channel.send({
-      content: '## 🎵 **Now Playing**',
-      embeds: [embed],
-      components: [row1, row2],
-    }).then((msg) => {
-      this.controlPanelMessageId = msg.id;
-      console.log(`[player] now-playing message sent, id=${msg.id}`);
-    }).catch((err) => {
-      console.warn(`[player] now-playing send failed: ${err.code} ${err.message}`);
-    });
+    // If control panel already exists (from /play), update it
+    if (this.controlPanelMessageId) {
+      console.log(`[player] updating existing control panel ${this.controlPanelMessageId}`);
+      channel.messages.edit(this.controlPanelMessageId, {
+        content: '## 🎵 **Now Playing**',
+        embeds: [embed],
+        components: [row1, row2],
+      }).then(() => {
+        console.log('[player] control panel updated for now playing');
+      }).catch((err) => {
+        console.warn(`[player] control panel update failed: ${err.code} ${err.message}`);
+        if (err?.code === 10008) {
+          this.controlPanelMessageId = null;
+        }
+      });
+    } else {
+      // No control panel - send a new one
+      console.log('[player] sending new control panel message');
+      channel.send({
+        content: '## 🎵 **Now Playing**',
+        embeds: [embed],
+        components: [row1, row2],
+      }).then((msg) => {
+        this.controlPanelMessageId = msg.id;
+        console.log(`[player] now-playing message sent, id=${msg.id}`);
+      }).catch((err) => {
+        console.warn(`[player] now-playing send failed: ${err.code} ${err.message}`);
+      });
+    }
   }
 
   /** Update the control panel with current state (progress, buttons, etc.) */
@@ -1158,13 +1173,18 @@ export class Player {
   /** Start periodic progress updates for the control panel */
   _startProgressUpdates() {
     this._stopProgressUpdates();
-    if (!this.controlPanelMessageId) return;
+    console.log(`[player] _startProgressUpdates: controlPanelMessageId=${this.controlPanelMessageId}`);
+    if (!this.controlPanelMessageId) {
+      console.log('[player] no control panel message ID, skipping progress updates');
+      return;
+    }
 
     this._progressInterval = setInterval(() => {
       if (this.destroyed || !this.isPlaying) {
         this._stopProgressUpdates();
         return;
       }
+      console.log('[player] progress update tick');
       this.updateControlPanel().catch(() => {});
     }, 30000); // Update every 30 seconds (less spammy)
   }
