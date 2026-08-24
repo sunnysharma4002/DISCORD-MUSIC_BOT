@@ -210,6 +210,13 @@ export async function resolveSpotify(rawUrl, requestedBy) {
 
 /** Runs a YouTube search and returns the first usable video, or null. */
 async function searchYouTube(query) {
+  const apiKey = process.env.YOUTUBE_API_KEY?.trim();
+
+  if (apiKey) {
+    const video = await searchYouTubeAPI(query, apiKey);
+    if (video) return video;
+  }
+
   const results = await YouTube.search(query, { limit: 5, type: 'video', safeSearch: false });
   if (!Array.isArray(results)) return null;
 
@@ -217,6 +224,77 @@ async function searchYouTube(query) {
   if (!video) return null;
 
   return normaliseVideo(video);
+}
+
+/** Searches YouTube via the official Data API v3. */
+async function searchYouTubeAPI(query, apiKey) {
+  try {
+    const url = new URL('https://www.googleapis.com/youtube/v3/search');
+    url.searchParams.set('part', 'snippet');
+    url.searchParams.set('q', query);
+    url.searchParams.set('type', 'video');
+    url.searchParams.set('maxResults', '5');
+    url.searchParams.set('key', apiKey);
+
+    const res = await fetch(url.toString());
+    if (!res.ok) {
+      console.warn(`[youtube-api] search returned HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    if (!data.items || data.items.length === 0) return null;
+
+    // Fetch full video details (duration, etc.) for the first result
+    const videoId = data.items[0].id.videoId;
+    const videoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${apiKey}`;
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) return normaliseSearchResult(data.items[0].snippet);
+
+    const videoData = await videoRes.json();
+    if (!videoData.items || videoData.items.length === 0) return normaliseSearchResult(data.items[0].snippet);
+
+    const item = videoData.items[0];
+    return {
+      title: item.snippet?.title ?? 'Unknown title',
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      videoId,
+      duration: parseISO8601Duration(item.contentDetails?.duration) * 1000,
+      isLive: false,
+      thumbnail: item.snippet?.thumbnails?.high?.url ?? item.snippet?.thumbnails?.default?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      author: item.snippet?.channelTitle ?? 'Unknown',
+      source: 'youtube',
+    };
+  } catch (err) {
+    console.warn(`[youtube-api] search error: ${err.message}`);
+    return null;
+  }
+}
+
+function normaliseSearchResult(snippet) {
+  if (!snippet) return null;
+  const videoId = snippet.resourceId?.videoId;
+  if (!videoId) return null;
+  return {
+    title: snippet.title ?? 'Unknown title',
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    videoId,
+    duration: 0,
+    isLive: false,
+    thumbnail: snippet.thumbnails?.high?.url ?? snippet.thumbnails?.default?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    author: snippet.channelTitle ?? 'Unknown',
+    source: 'youtube',
+  };
+}
+
+function parseISO8601Duration(duration) {
+  if (!duration) return 0;
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  const hours = parseInt(match[1] || 0, 10);
+  const minutes = parseInt(match[2] || 0, 10);
+  const seconds = parseInt(match[3] || 0, 10);
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function normaliseVideo(video) {

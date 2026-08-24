@@ -11,12 +11,10 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
-import { get } from 'node:https';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 
@@ -64,66 +62,9 @@ function ytdlpCmd() {
   return { bin, pre };
 }
 
-// Anti-bot ("Sign in to confirm you're not a bot") mitigation.
-// YouTube blocks datacenter IPs (Railway) unless the request carries cookies
-// and/or uses a mobile client. These args are appended to every yt-dlp call.
-//
-// Cookies (best fix — from a logged-in account) via either:
-//   YOUTUBE_COOKIE_FILE = absolute path to a Netscape cookies.txt
-//   YOUTUBE_COOKIES     = full cookies.txt *contents* (Railway var; written to /tmp)
-// Client spoofing helps even without cookies and is always applied.
-let _cookieFileCache; // undefined = not resolved, null = none, string = path
-function resolveCookieFile() {
-  logEnvState();
-  if (_cookieFileCache !== undefined) return _cookieFileCache;
-
-  if (process.env.YOUTUBE_COOKIE_FILE && existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
-    _cookieFileCache = process.env.YOUTUBE_COOKIE_FILE;
-  } else if (process.env.YOUTUBE_COOKIES) {
-    try {
-      const p = join(tmpdir(), 'yt-cookies.txt');
-      let contents = process.env.YOUTUBE_COOKIES;
-      // Netscape files must start with this header line or yt-dlp rejects them.
-      if (!contents.startsWith('# Netscape') && !contents.startsWith('# HTTP')) {
-        // Check if it's browser cookie header format (key=value;key=value)
-        // vs already Netscape format (tab-separated lines)
-        if (contents.includes(';') && !contents.includes('\t')) {
-          // Convert browser cookie header to Netscape format
-          const pairs = contents.split(';').map(s => s.trim()).filter(Boolean);
-          const lines = ['# Netscape HTTP Cookie File'];
-          for (const pair of pairs) {
-            const eqIdx = pair.indexOf('=');
-            if (eqIdx === -1) continue;
-            const name = pair.substring(0, eqIdx).trim();
-            const value = pair.substring(eqIdx + 1).trim();
-            // Netscape format: domain  flag  path  secure  expiration  name  value
-            lines.push(`.youtube.com\tTRUE\t/\tTRUE\t0\t${name}\t${value}`);
-          }
-          contents = lines.join('\n');
-        } else {
-          contents = '# Netscape HTTP Cookie File\n' + contents;
-        }
-      }
-      writeFileSync(p, contents);
-      _cookieFileCache = p;
-      console.log('[player] wrote YouTube cookies from env to', p);
-      console.log('[player] cookie lines:', contents.split('\n').length);
-    } catch (err) {
-      console.warn('[player] failed to write cookies from env:', err.message);
-      _cookieFileCache = null;
-    }
-  } else {
-    _cookieFileCache = null;
-  }
-  return _cookieFileCache;
-}
-
-/** Shared yt-dlp args to dodge YouTube's bot check. */
+/** yt-dlp args for mobile client spoofing. */
 function antiBotArgs() {
-  const cookies = resolveCookieFile();
-  console.log(`[player] antiBotArgs: cookies=${cookies || 'none (using player_client fallback)'}`);
-
-  const args = [
+  return [
     // Try multiple player clients — mobile/TV clients are less aggressively checked.
     '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web',
     // Skip HLS formats (often require additional auth)
@@ -133,30 +74,12 @@ function antiBotArgs() {
     '--retry-sleep', 'extractor:3',
     // Fake referer to look like embedded player
     '--referer', 'https://www.youtube.com/',
-    // Skip certificate verification (helps with some proxy setups)
+    // Skip certificate verification
     '--no-check-certificate',
     // Add headers to look like a real browser
     '--add-header', 'Origin:https://www.youtube.com',
     '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
   ];
-  if (cookies) {
-    args.push('--cookies', cookies);
-    console.log('[player] Using cookies for authentication');
-  } else {
-    console.log('[player] No cookies - relying on player_client spoofing only');
-  }
-  return args;
-}
-
-// Debug: log env var presence on first call
-let _envLogged = false;
-function logEnvState() {
-  if (_envLogged) return;
-  _envLogged = true;
-  const hasFile = !!process.env.YOUTUBE_COOKIE_FILE;
-  const hasCookies = !!process.env.YOUTUBE_COOKIES;
-  const cookiesLen = process.env.YOUTUBE_COOKIES?.length || 0;
-  console.log(`[player] env check: YOUTUBE_COOKIE_FILE=${hasFile}, YOUTUBE_COOKIES=${hasCookies} (len=${cookiesLen})`);
 }
 
 const STUCK_TIMEOUT_MS = 30_000;   // no audio started within this window → skip
@@ -272,17 +195,14 @@ export class Player {
     }, 5000);
   }
 
-  /** Test YouTube extraction without cookies */
+  /** Test YouTube extraction */
   _testYouTubeExtraction() {
     const { bin, pre } = ytdlpCmd();
-    const cookies = resolveCookieFile();
-    const proxies = this._getProxies();
 
-    console.log(`[player] testing YouTube extraction (cookies=${cookies ? 'yes' : 'no'}, proxies=${proxies.length})`);
+    console.log('[player] testing YouTube extraction');
 
     const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
 
-    // Test without cookies and without proxy first
     const args = [
       ...pre,
       '-J',
@@ -304,45 +224,13 @@ export class Player {
       if (code === 0) {
         try {
           const info = JSON.parse(stdout);
-          console.log(`[player] ✓ YouTube extraction OK (direct): "${info.title}"`);
+          console.log(`[player] ✓ YouTube extraction OK: "${info.title}"`);
         } catch (e) {
-          console.log(`[player] ✓ YouTube extraction OK (direct, metadata fetched)`);
+          console.log(`[player] ✓ YouTube extraction OK (metadata fetched)`);
         }
       } else {
-        console.error(`[player] ✗ YouTube extraction FAILED (direct, code ${code})`);
+        console.error(`[player] ✗ YouTube extraction FAILED (code ${code})`);
         console.error(`[player] stderr: ${stderr.trim().substring(0, 300)}`);
-
-        if (stderr.includes('Sign in to confirm') && proxies.length > 0) {
-          console.log('[player] YouTube requires authentication. Testing first 3 proxies...');
-
-          // Test first 3 proxies quickly
-          let tested = 0;
-          for (const proxy of proxies.slice(0, 3)) {
-            console.log(`[player] Testing proxy: ${proxy}`);
-            const proxyArgs = [...pre, '-J', '--no-playlist', '--no-warnings', '--proxy', proxy, '--extractor-args', 'youtube:player_client=ios', testUrl];
-            const proc2 = spawn(bin, proxyArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-            let out2 = '';
-            let err2 = '';
-            proc2.stdout.on('data', (d) => { out2 += d.toString(); });
-            proc2.stderr.on('data', (d) => { err2 += d.toString(); });
-            proc2.on('close', (code2) => {
-              tested++;
-              if (code2 === 0) {
-                console.log(`[player] ✓ Proxy ${proxy} WORKS!`);
-              } else {
-                console.error(`[player] ✗ Proxy ${proxy} FAILED (code ${code2})`);
-              }
-              if (tested >= 3) {
-                console.error('[player] SOLUTION: Set YTDLP_PROXIES env var with working proxies');
-                console.error('[player] Format: host:port:username:password,host2:port2:username2:password2');
-              }
-            });
-            setTimeout(() => { try { proc2.kill('SIGKILL'); } catch {} }, 8000);
-          }
-        } else if (proxies.length === 0) {
-          console.error('[player] No proxies configured. Set YTDLP_PROXIES env var.');
-          console.error('[player] Format: host:port:username:password,host2:port2:username2:password2');
-        }
       }
     });
 
@@ -792,88 +680,25 @@ export class Player {
     const { bin, pre } = ytdlpCmd();
     console.log(`[player] using bin="${bin}" pre=${JSON.stringify(pre)}`);
 
-    // Proxy support: try multiple proxies from env var
-    const proxies = this._getProxies();
-    console.log(`[player] loaded ${proxies.length} proxies`);
-    const hasCookies = !!resolveCookieFile();
+    const args = [
+      '-f', 'bestaudio/best',
+      '--no-playlist',
+      '--quiet',
+      '--no-warnings',
+      '-o', '-',
+      ...antiBotArgs(),
+      url,
+    ];
 
-    // Build extraction phases — go straight to yt-dlp
-    const allAttempts = [];
+    console.log(`[player] cmd: ${args.join(' ').substring(0, 150)}...`);
+    const result = await this._trySpawnStream(bin, pre, track, url, args);
 
-    // PHASE 1: YouTube direct with cookies
-    if (hasCookies) {
-      allAttempts.push({
-        phase: 'yt+cookies',
-        proxy: null,
-        extractorSets: [antiBotArgs()],
-        formatSelectors: ['bestaudio/best'],
-      });
+    if (result) {
+      console.log('[player] extraction SUCCESS!');
+      return result;
     }
 
-    // PHASE 2: YouTube direct without cookies, different clients
-    allAttempts.push({
-      phase: 'yt-no-cookies',
-      proxy: null,
-      extractorSets: [
-        ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
-        ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-        ['--extractor-args', 'youtube:player_client=tv_embedded', '--extractor-retries', '5'],
-      ],
-      formatSelectors: ['bestaudio/best'],
-    });
-
-    // PHASE 3: Each proxy with YouTube (most likely to work from datacenter IPs)
-    for (const proxy of proxies) {
-      allAttempts.push({
-        phase: 'proxy',
-        proxy,
-        extractorSets: [
-          ['--extractor-args', 'youtube:player_client=android', '--extractor-retries', '5'],
-          ['--extractor-args', 'youtube:player_client=ios', '--extractor-retries', '5'],
-          ...(hasCookies ? [antiBotArgs()] : []),
-        ],
-        formatSelectors: ['bestaudio/best'],
-      });
-    }
-
-    for (let attemptIdx = 0; attemptIdx < allAttempts.length; attemptIdx++) {
-      const { phase, proxy, extractorSets: sets, formatSelectors } = allAttempts[attemptIdx];
-      const proxyArgs = proxy ? ['--proxy', proxy] : [];
-      const proxyLabel = proxy ? proxy.substring(0, 50) + '...' : 'direct';
-
-      console.log(`[player] === Attempt ${attemptIdx+1}/${allAttempts.length}: ${phase} (${proxyLabel}) ===`);
-
-      for (let setIdx = 0; setIdx < sets.length; setIdx++) {
-        for (const format of formatSelectors) {
-          const extraArgs = sets[setIdx];
-          const args = [
-            '-f', format,
-            '--no-playlist',
-            '--quiet',
-            '--no-warnings',
-            ...proxyArgs,
-            '-o', '-',
-            ...extraArgs,
-            url,
-          ];
-          console.log(`[player] cmd: ${args.join(' ').substring(0, 150)}...`);
-          const result = await this._trySpawnStream(bin, pre, track, url, args);
-
-          if (result) {
-            console.log(`[player] SUCCESS in attempt ${attemptIdx+1} (${phase})!`);
-            return result;
-          }
-        }
-
-        if (setIdx < sets.length - 1) {
-          await new Promise(r => setTimeout(r, 500));
-        }
-      }
-
-      console.log(`[player] attempt ${attemptIdx+1} (${phase}) failed`);
-    }
-
-    throw new Error('All extraction attempts failed. Try: 1) Add fresh proxies to YTDLP_PROXIES env var, 2) Use fresh YOUTUBE_COOKIES, or 3) Switch hosting provider.');
+    throw new Error('Extraction failed. Check that your host can reach YouTube and that yt-dlp is installed.');
   }
 
   /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
@@ -1020,51 +845,13 @@ export class Player {
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
     if (/age.?restrict|confirm your age/i.test(msg)) return 'the video is age-restricted.';
     if (/confirm.*not a bot|sign in to confirm/i.test(msg)) {
-      return 'YouTube is blocking the server (bot check). Set the `YOUTUBE_COOKIES` env var with a logged-in cookies.txt — see README.';
+      return 'YouTube is blocking the server (bot check). Try again shortly or use a different hosting provider.';
     }
     if (/429|rate/i.test(msg)) return 'YouTube is rate-limiting the bot. Try again shortly.';
     if (/no.*format|playable/i.test(msg)) return 'no playable audio stream was found.';
     if (/premium|members/i.test(msg)) return 'the video requires a paid membership.';
     if (/ENOENT/i.test(msg)) return 'yt-dlp is not installed or not on PATH.';
     return msg.slice(0, 150) || 'unknown streaming error.';
-  }
-
-  /** Parse proxies from YTDLP_PROXIES env var (comma-separated list). */
-  _getProxies() {
-    const proxiesStr = (process.env.YTDLP_PROXIES || '').trim();
-    if (!proxiesStr) return [];
-
-    const proxies = [];
-    const parts = proxiesStr.split(',').map(s => s.trim()).filter(Boolean);
-
-    for (const part of parts) {
-      // Format: host:port:username:password or host:port
-      const segments = part.split(':');
-      if (segments.length >= 2) {
-        let proxy;
-        if (segments.length >= 4) {
-          // With auth: host:port:username:password
-          const [host, port, user, pass] = segments;
-          proxy = `http://${user}:${pass}@${host}:${port}`;
-        } else {
-          // Without auth: host:port
-          const [host, port] = segments;
-          proxy = `http://${host}:${port}`;
-        }
-        proxies.push(proxy);
-      }
-    }
-
-    // Put working proxy first if specified
-    const workingProxy = process.env.YTDLP_WORKING_PROXY?.trim();
-    if (workingProxy && proxies.includes(workingProxy)) {
-      const idx = proxies.indexOf(workingProxy);
-      proxies.splice(idx, 1);
-      proxies.unshift(workingProxy);
-      console.log(`[player] prioritized working proxy: ${workingProxy}`);
-    }
-
-    return proxies;
   }
 
   /* ---------------------------------------------------------------- */
