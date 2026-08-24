@@ -264,7 +264,8 @@ async function searchYouTubeAPI(query, apiKey) {
 
     const item = videoData.items[0];
     const title = item.snippet?.title?.trim() || 'Unknown title';
-    const thumbnail = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+    // Use clean thumbnail URL without query parameters for Discord compatibility
+    const thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
     const author = item.snippet?.channelTitle?.trim() || 'Unknown';
 
     return {
@@ -289,7 +290,8 @@ function normaliseSearchResult(snippet) {
   if (!videoId) return null;
 
   const title = snippet.title?.trim() || 'Unknown title';
-  const thumbnail = snippet.thumbnails?.high?.url || snippet.thumbnails?.default?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  // Use clean thumbnail URL without query parameters for Discord compatibility
+  const thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const author = snippet.channelTitle?.trim() || 'Unknown';
 
   return {
@@ -317,15 +319,17 @@ function parseISO8601Duration(duration) {
 function normaliseVideo(video) {
   const durationMs = Number(video.duration) || 0;
   const title = video.title?.trim() || 'Unknown title';
-  const thumbnail = video.thumbnail?.url || video.thumbnail?.displayThumbnailURL?.() || (video.id ? `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg` : null);
+  // Use clean thumbnail URL without query parameters for Discord compatibility
+  const videoId = video.id;
+  const thumbnail = videoId ? `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg` : null;
   const author = video.channel?.name?.trim() || 'Unknown';
 
-  console.log(`[resolver] normaliseVideo: title="${title}" author="${author}" thumbnail=${thumbnail?.substring(0, 60)} videoId=${video.id}`);
+  console.log(`[resolver] normaliseVideo: title="${title}" author="${author}" thumbnail=${thumbnail?.substring(0, 60)} videoId=${videoId}`);
 
   return {
     title,
-    url: video.url || `https://www.youtube.com/watch?v=${video.id}`,
-    videoId: video.id,
+    url: video.url || `https://www.youtube.com/watch?v=${videoId}`,
+    videoId,
     duration: durationMs,
     isLive: Boolean(video.live) || durationMs === 0,
     thumbnail,
@@ -384,7 +388,7 @@ async function fetchPlaylistViaYtdlp(url) {
           url: entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
           id: entry.id,
           duration: entry.duration ? entry.duration * 1000 : 0,
-          thumbnail: `https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`,
+          thumbnail: `https://i.ytimg.com/vi/${entry.id}/maxresdefault.jpg`,
           author: entry.channel || entry.uploader || 'Unknown',
         })).filter((e) => e.id);
 
