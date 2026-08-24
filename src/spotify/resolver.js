@@ -211,19 +211,27 @@ export async function resolveSpotify(rawUrl, requestedBy) {
 /** Runs a YouTube search and returns the first usable video, or null. */
 async function searchYouTube(query) {
   const apiKey = process.env.YOUTUBE_API_KEY?.trim();
+  console.log(`[resolver] searchYouTube: query="${query.substring(0, 50)}" apiKey=${apiKey ? 'set' : 'missing'}`);
 
   if (apiKey) {
     const video = await searchYouTubeAPI(query, apiKey);
-    if (video) return video;
+    if (video) {
+      console.log(`[resolver] API search found: "${video.title.substring(0, 50)}" thumbnail=${video.thumbnail?.substring(0, 60)}`);
+      return video;
+    }
+    console.log('[resolver] API search returned no results');
   }
 
+  console.log('[resolver] falling back to youtube-sr');
   const results = await YouTube.search(query, { limit: 5, type: 'video', safeSearch: false });
   if (!Array.isArray(results)) return null;
 
   const video = results.find((v) => v?.id && v?.title && !v?.private);
   if (!video) return null;
 
-  return normaliseVideo(video);
+  const result = normaliseVideo(video);
+  console.log(`[resolver] youtube-sr found: "${result.title.substring(0, 50)}" thumbnail=${result.thumbnail?.substring(0, 60)}`);
+  return result;
 }
 
 /** Searches YouTube via the official Data API v3. */
@@ -311,6 +319,8 @@ function normaliseVideo(video) {
   const title = video.title?.trim() || 'Unknown title';
   const thumbnail = video.thumbnail?.url || video.thumbnail?.displayThumbnailURL?.() || (video.id ? `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg` : null);
   const author = video.channel?.name?.trim() || 'Unknown';
+
+  console.log(`[resolver] normaliseVideo: title="${title}" author="${author}" thumbnail=${thumbnail?.substring(0, 60)} videoId=${video.id}`);
 
   return {
     title,
