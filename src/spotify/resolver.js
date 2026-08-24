@@ -255,14 +255,18 @@ async function searchYouTubeAPI(query, apiKey) {
     if (!videoData.items || videoData.items.length === 0) return normaliseSearchResult(data.items[0].snippet);
 
     const item = videoData.items[0];
+    const title = item.snippet?.title?.trim() || 'Unknown title';
+    const thumbnail = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+    const author = item.snippet?.channelTitle?.trim() || 'Unknown';
+
     return {
-      title: item.snippet?.title ?? 'Unknown title',
+      title,
       url: `https://www.youtube.com/watch?v=${videoId}`,
       videoId,
       duration: parseISO8601Duration(item.contentDetails?.duration) * 1000,
       isLive: false,
-      thumbnail: item.snippet?.thumbnails?.high?.url ?? item.snippet?.thumbnails?.default?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      author: item.snippet?.channelTitle ?? 'Unknown',
+      thumbnail,
+      author,
       source: 'youtube',
     };
   } catch (err) {
@@ -275,14 +279,19 @@ function normaliseSearchResult(snippet) {
   if (!snippet) return null;
   const videoId = snippet.resourceId?.videoId;
   if (!videoId) return null;
+
+  const title = snippet.title?.trim() || 'Unknown title';
+  const thumbnail = snippet.thumbnails?.high?.url || snippet.thumbnails?.default?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const author = snippet.channelTitle?.trim() || 'Unknown';
+
   return {
-    title: snippet.title ?? 'Unknown title',
+    title,
     url: `https://www.youtube.com/watch?v=${videoId}`,
     videoId,
     duration: 0,
     isLive: false,
-    thumbnail: snippet.thumbnails?.high?.url ?? snippet.thumbnails?.default?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    author: snippet.channelTitle ?? 'Unknown',
+    thumbnail,
+    author,
     source: 'youtube',
   };
 }
@@ -299,17 +308,18 @@ function parseISO8601Duration(duration) {
 
 function normaliseVideo(video) {
   const durationMs = Number(video.duration) || 0;
+  const title = video.title?.trim() || 'Unknown title';
+  const thumbnail = video.thumbnail?.url || video.thumbnail?.displayThumbnailURL?.() || (video.id ? `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg` : null);
+  const author = video.channel?.name?.trim() || 'Unknown';
+
   return {
-    title: video.title ?? 'Unknown title',
-    url: video.url ?? `https://www.youtube.com/watch?v=${video.id}`,
+    title,
+    url: video.url || `https://www.youtube.com/watch?v=${video.id}`,
     videoId: video.id,
     duration: durationMs,
     isLive: Boolean(video.live) || durationMs === 0,
-    thumbnail:
-      video.thumbnail?.url ??
-      video.thumbnail?.displayThumbnailURL?.() ??
-      (video.id ? `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg` : null),
-    author: video.channel?.name ?? 'Unknown',
+    thumbnail,
+    author,
     source: 'youtube',
   };
 }
@@ -364,6 +374,8 @@ async function fetchPlaylistViaYtdlp(url) {
           url: entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
           id: entry.id,
           duration: entry.duration ? entry.duration * 1000 : 0,
+          thumbnail: `https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`,
+          author: entry.channel || entry.uploader || 'Unknown',
         })).filter((e) => e.id);
 
         resolve({
@@ -411,8 +423,8 @@ export async function resolveYouTube(rawQuery, requestedBy) {
           videoId: e.id,
           duration: e.duration,
           isLive: false,
-          thumbnail: `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg`,
-          author: 'Unknown',
+          thumbnail: e.thumbnail || `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg`,
+          author: e.author || 'Unknown',
           source: 'youtube',
           requestedBy,
         })),

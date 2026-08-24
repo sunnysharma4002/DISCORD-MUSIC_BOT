@@ -700,13 +700,13 @@ export class Player {
         : candidates[Math.floor(Math.random() * candidates.length)];
 
       return {
-        title: pick.title ?? 'Unknown title',
+        title: pick.title?.trim() || 'Unknown title',
         url: pick.url ?? `https://www.youtube.com/watch?v=${pick.id}`,
         videoId: pick.id,
         duration: (Number(pick.duration) || 0) * 1000, // youtube-sr returns seconds
         isLive: Boolean(pick.live),
         thumbnail: pick.thumbnail?.url ?? `https://i.ytimg.com/vi/${pick.id}/hqdefault.jpg`,
-        author: pick.channel?.name ?? 'Unknown',
+        author: pick.channel?.name?.trim() || 'Unknown',
         source: 'youtube',
         requestedBy: finished.requestedBy,
       };
@@ -726,8 +726,11 @@ export class Player {
     const videoId = track.videoId || extractVideoId(url);
     console.log(`[player] _createResource: "${track.title?.substring(0, 50)}" videoId="${videoId}"`);
 
-    // Enrich metadata if missing
-    if (!track.duration || !track.author || track.title === 'YouTube video') {
+    // Enrich metadata if missing or incomplete
+    const needsEnrichment = !track.duration || !track.author || !track.title ||
+      track.title === 'YouTube video' || track.title === 'Unknown title' ||
+      !track.thumbnail || !track.thumbnail.startsWith('http');
+    if (needsEnrichment) {
       try {
         await this._enrichMetadata(track, url);
       } catch (err) {
@@ -942,6 +945,7 @@ export class Player {
 
   /** Best-effort metadata fetch via `yt-dlp -J` (single JSON dump). */
   async _enrichMetadata(track, url) {
+    console.log(`[enrich] starting for "${track.title}" url="${url?.substring(0, 60)}"`);
     const { bin, pre } = ytdlpCmd();
     const info = await new Promise((resolve, reject) => {
       const proc = spawn(
@@ -960,11 +964,29 @@ export class Player {
       });
     });
 
-    if (track.title === 'YouTube video' && info.title) track.title = info.title;
+    console.log(`[enrich] got info: title="${info.title?.substring(0, 50)}" thumbnail="${info.thumbnail?.substring(0, 60)}"`);
+
+    // Update title if missing, default, or unknown
+    if ((!track.title || track.title === 'YouTube video' || track.title === 'Unknown title') && info.title) {
+      track.title = info.title;
+      console.log(`[enrich] updated title to "${info.title.substring(0, 50)}"`);
+    }
     track.isLive = Boolean(info.is_live);
-    if (!track.duration && info.duration) track.duration = info.duration * 1000;
-    if (!track.author) track.author = info.uploader ?? info.channel ?? 'Unknown';
-    if (!track.thumbnail && info.thumbnail) track.thumbnail = info.thumbnail;
+    if (!track.duration && info.duration) {
+      track.duration = info.duration * 1000;
+      console.log(`[enrich] updated duration to ${info.duration}s`);
+    }
+    if ((!track.author || track.author === 'Unknown') && (info.uploader ?? info.channel)) {
+      track.author = info.uploader ?? info.channel;
+      console.log(`[enrich] updated author to "${track.author}"`);
+    }
+    // Always update thumbnail if we have a better one from yt-dlp
+    if (info.thumbnail) {
+      if (!track.thumbnail || track.thumbnail.includes('hqdefault') || track.thumbnail === 'Unknown') {
+        track.thumbnail = info.thumbnail;
+        console.log(`[enrich] updated thumbnail to "${info.thumbnail.substring(0, 60)}"`);
+      }
+    }
   }
 
   _friendlyError(err) {
@@ -1212,6 +1234,8 @@ export class Player {
         .setDescription('🎵 Nothing is playing right now. Use `/play` to start.');
     }
 
+    console.log(`[embed] title="${t.title}" author="${t.author}" thumbnail="${t.thumbnail?.substring(0, 60)}" duration=${t.duration}`);
+
     const themeColor = this.theme ? THEMES[this.theme]?.color ?? 0x5865f2 : 0x5865f2;
     const playback = this.playbackMs;
     const duration = t.duration || 0;
@@ -1224,7 +1248,7 @@ export class Player {
           ? 'https://cdn-icons-png.flaticon.com/512/174/174869.png'
           : 'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
       })
-      .setTitle(`🎶 ${truncate(t.title, 200)}`)
+      .setTitle(`🎶 ${truncate(t.title || 'Unknown Title', 200)}`)
       .setURL(t.url)
       .addFields({
         name: '🎤 Artist',
@@ -1265,8 +1289,14 @@ export class Player {
       embed.setFooter({ text: `${loopLabel} · ${queueInfo}` });
     }
 
-    if (t.thumbnail) {
+    if (t.thumbnail && t.thumbnail.startsWith('http')) {
       embed.setThumbnail(t.thumbnail);
+      console.log(`[embed] thumbnail set: ${t.thumbnail.substring(0, 60)}...`);
+    } else {
+      // Fallback: use YouTube's default thumbnail
+      const fallbackThumbnail = `https://i.ytimg.com/vi/${t.videoId || 'default'}/hqdefault.jpg`;
+      embed.setThumbnail(fallbackThumbnail);
+      console.log(`[embed] using fallback thumbnail: ${fallbackThumbnail}`);
     }
 
     embed.setTimestamp(new Date());
