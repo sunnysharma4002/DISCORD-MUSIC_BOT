@@ -962,6 +962,7 @@ export class Player {
   /** Best-effort metadata fetch via `yt-dlp -J` (single JSON dump). */
   async _enrichMetadata(track, url) {
     console.log(`[enrich] starting for "${track.title}" url="${url?.substring(0, 60)}"`);
+    console.log(`[enrich] current data: title="${track.title}" author="${track.author}" thumbnail="${track.thumbnail}"`);
     const { bin, pre } = ytdlpCmd();
     const info = await new Promise((resolve, reject) => {
       const proc = spawn(
@@ -980,7 +981,7 @@ export class Player {
       });
     });
 
-    console.log(`[enrich] got info: title="${info.title?.substring(0, 50)}" thumbnail="${info.thumbnail?.substring(0, 60)}"`);
+    console.log(`[enrich] got info: title="${info.title?.substring(0, 50)}" thumbnail="${info.thumbnail?.substring(0, 60)}" uploader="${info.uploader}"`);
 
     // Update title if missing, default, or unknown
     if ((!track.title || track.title === 'YouTube video' || track.title === 'Unknown title') && info.title) {
@@ -1001,7 +1002,11 @@ export class Player {
       if (!track.thumbnail || track.thumbnail.includes('hqdefault') || track.thumbnail === 'Unknown') {
         track.thumbnail = info.thumbnail;
         console.log(`[enrich] updated thumbnail to "${info.thumbnail.substring(0, 60)}"`);
+      } else {
+        console.log(`[enrich] keeping existing thumbnail: ${track.thumbnail.substring(0, 60)}`);
       }
+    } else {
+      console.log(`[enrich] no thumbnail from yt-dlp`);
     }
   }
 
