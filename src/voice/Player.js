@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { tmpir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
