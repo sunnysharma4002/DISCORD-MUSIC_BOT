@@ -317,7 +317,7 @@ function parseISO8601Duration(duration) {
 }
 
 function normaliseVideo(video) {
-  const durationMs = Number(video.duration) || 0;
+  const durationMs = (Number(video.duration) || 0) * 1000;
   const title = video.title?.trim() || 'Unknown title';
   // Use clean thumbnail URL without query parameters for Discord compatibility
   const videoId = video.id;
