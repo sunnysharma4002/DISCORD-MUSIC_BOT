@@ -14,6 +14,16 @@ export default {
     ),
 
   async execute(interaction) {
+    try {
+      await interaction.deferReply();
+    } catch (err) {
+      if (err?.code === 10062 || err?.code === 40060) {
+        console.warn(`[play] Interaction already handled or expired: ${err.code}`);
+        return;
+      }
+      throw err;
+    }
+
     // Accept BOTH option names: our fresh command uses `query`, but a stale
     // legacy `/play` (option named `song`) may still be cached in clients.
     const query =
@@ -29,45 +39,35 @@ export default {
         resolved: interaction.options?.resolved ?? null,
         rawOptions: interaction.rawOptions ?? null,
       }));
-      try {
-        return await interaction.reply({
-          content:
-            '❌ Discord sent this command with an empty `query`.\n\n' +
-            'This is a **client cache** problem — your Discord app is showing an old `/play` that doesn\'t require a query.\n\n' +
-            '**Fix:** fully close and reopen Discord (or press Ctrl/Cmd+R in the desktop app). If you\'re on mobile, force-close and reopen the app.\n\n' +
-            'Still stuck? Run `/deploy` in this server (admins only), then reload Discord.',
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch (err) {
-        // 10062 = another instance already answered this interaction (duplicate process)
-        console.warn('[play] Empty-query reply failed (possibly duplicate instance):', err?.code ?? err?.message);
-        return null;
-      }
+      return interaction.editReply({
+        content:
+          '❌ Discord sent this command with an empty `query`.\n\n' +
+          'This is a **client cache** problem — your Discord app is showing an old `/play` that doesn\'t require a query.\n\n' +
+          '**Fix:** fully close and reopen Discord (or press Ctrl/Cmd+R in the desktop app). If you\'re on mobile, force-close and reopen the app.\n\n' +
+          'Still stuck? Run `/deploy` in this server (admins only), then reload Discord.',
+      });
     }
 
-    /* -- Voice channel + permission checks (before deferring) ------ */
+    /* -- Voice channel + permission checks ------------------------- */
     const voiceChannel = interaction.member?.voice?.channel;
     if (!voiceChannel) {
-      return interaction.reply({
+      return interaction.editReply({
         content: '❌ Join a voice channel first.',
-        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (voiceChannel.type === 13) {
       // Stage channels need extra handling (bot must be a speaker) — reject clearly.
-      return interaction.reply({
+      return interaction.editReply({
         content: '❌ I can\'t play music in a **Stage** channel. Use a normal voice channel.',
-        flags: MessageFlags.Ephemeral,
       });
     }
 
     const me = interaction.guild.members.me;
     const botVoiceId = me?.voice?.channelId;
     if (botVoiceId && botVoiceId !== voiceChannel.id) {
-      return interaction.reply({
+      return interaction.editReply({
         content: `❌ I'm already playing in <#${botVoiceId}>.`,
-        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -77,22 +77,18 @@ export default {
     if (!perms?.has('Connect')) missing.push('Connect');
     if (!perms?.has('Speak')) missing.push('Speak');
     if (missing.length > 0) {
-      return interaction.reply({
+      return interaction.editReply({
         content: `❌ I need the **${missing.join('** and **')}** permission${missing.length > 1 ? 's' : ''} in <#${voiceChannel.id}>.`,
-        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (voiceChannel.full && !perms.has('MoveMembers')) {
-      return interaction.reply({
+      return interaction.editReply({
         content: '❌ That voice channel is full.',
-        flags: MessageFlags.Ephemeral,
       });
     }
 
     /* -- Resolve + play -------------------------------------------- */
-    await interaction.deferReply();
-
     const player = interaction.client.getPlayer(interaction.guild.id, true);
 
     try {
