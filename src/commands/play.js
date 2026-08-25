@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
-import { resolveQuery, isSpotifyURL, isSoundCloudURL } from '../spotify/resolver.js';
+import { resolveQuery, isSpotifyURL, isSoundCloudURL, isJioSaavnURL } from '../spotify/resolver.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -101,6 +101,7 @@ export default {
       return interaction.editReply(`❌ ${err.message}`);
     }
 
+    console.log(`[play] resolving query: "${query.substring(0, 100)}" source=${isSpotifyURL(query) ? 'spotify' : isSoundCloudURL(query) ? 'soundcloud' : isJioSaavnURL(query) ? 'jiosaavn' : 'youtube'}`);
     let result;
     try {
       result = await resolveQuery(query, interaction.user.id);
@@ -128,7 +129,7 @@ export default {
           { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
           { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
           { name: '📍 Position', value: 'Playing now', inline: true },
-          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : 'YouTube', inline: true },
+          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : isJioSaavnURL(query) ? 'JioSaavn' : 'YouTube', inline: true },
           { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
         );
       if (t.thumbnail && t.thumbnail.startsWith('http')) {
@@ -146,7 +147,7 @@ export default {
       console.log(`[play] control panel created with buttons, message id=${reply.id}`);
     } else {
       // Added to queue - show queue style embed
-      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : 'YouTube';
+      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : isJioSaavnURL(query) ? 'JioSaavn' : 'YouTube';
       const embed = new EmbedBuilder().setColor(0x57f287);
 
       if (tracks.length === 1) {

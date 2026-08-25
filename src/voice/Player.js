@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
+import { relayAudioStream, isRelayEnabled } from '../utils/vercel-relay.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -212,7 +213,12 @@ export class Player {
 
     this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
       this._clearStuckTimer();
-      this._advance().catch((err) => console.error('[player] advance error:', err));
+      // Only advance if we're not in the middle of a voice connection issue
+      if (this.connection?.state.status === VoiceConnectionStatus.Ready) {
+        this._advance().catch((err) => console.error('[player] advance error:', err));
+      } else {
+        console.log('[audio] Idle but connection not ready, skipping advance');
+      }
     });
 
     this.audioPlayer.on('error', (err) => {
@@ -309,7 +315,19 @@ export class Player {
     this.textChannelId = textChannel?.id ?? this.textChannelId;
 
     if (this.connection && this.voiceChannelId === voiceChannel.id) {
-      return this.connection;
+      // Connection already exists and is for the same channel
+      if (this.connection.state.status === VoiceConnectionStatus.Ready) {
+        return this.connection;
+      }
+      // Wait for existing connection to become ready
+      try {
+        await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
+        return this.connection;
+      } catch {
+        // Connection failed, destroy and recreate
+        console.warn('[voice] Existing connection not ready, recreating...');
+        try { this.connection.destroy(); } catch {}
+      }
     }
 
     // @discordjs/voice REUSES a tracked connection for the guild — even a broken
@@ -348,8 +366,31 @@ export class Player {
     //   Signalling → Connecting → Ready   = healthy
     //   stuck in Signalling               = voice server update never arrived (gateway)
     //   stuck in Connecting               = UDP socket couldn't complete (host blocks UDP)
+    let lastStateChange = Date.now();
+    let rapidCycles = 0;
+    const CYCLE_THRESHOLD_MS = 5000; // 5 seconds
+    const MAX_RAPID_CYCLES = 8;
     connection.on('stateChange', (oldState, newState) => {
       if (oldState.status !== newState.status) {
+        const now = Date.now();
+        // Detect rapid cycling (more than MAX_RAPID_CYCLES in CYCLE_THRESHOLD_MS)
+        if (now - lastStateChange < CYCLE_THRESHOLD_MS) {
+          rapidCycles++;
+          if (rapidCycles >= MAX_RAPID_CYCLES) {
+            console.warn(`[voice] Rapid state cycling detected (${rapidCycles} cycles in ${CYCLE_THRESHOLD_MS}ms) — forcing reconnect.`);
+            rapidCycles = 0;
+            lastStateChange = now;
+            // Force a clean reconnect
+            try {
+              connection.reconnect();
+            } catch {}
+            return;
+          }
+        } else {
+          rapidCycles = Math.max(0, rapidCycles - 1);
+        }
+        lastStateChange = now;
+
         console.log(`[voice] state: ${oldState.status} → ${newState.status}`);
         // Re-subscribe on Ready to ensure audio pipe is connected
         if (newState.status === VoiceConnectionStatus.Ready) {
@@ -362,18 +403,34 @@ export class Player {
     // Don't auto-destroy while we're still waiting for the initial Ready state —
     // a transient disconnect during handshake would otherwise nuke the connect.
     let connecting = true;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       if (connecting) {
         console.warn('[voice] Disconnected during initial connect — waiting for reconnection.');
         return;
       }
+
+      // Prevent infinite reconnection loops
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.warn('[voice] Max reconnection attempts reached — destroying player.');
+        this.destroy();
+        return;
+      }
+
+      reconnectAttempts++;
+      console.log(`[voice] reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+
       try {
         // Could be a region move — wait to see if it reconnects
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
+        // Reset attempts on successful reconnection
+        reconnectAttempts = 0;
       } catch {
+        console.warn('[voice] Reconnection failed');
         this.destroy();
       }
     });
@@ -722,12 +779,31 @@ export class Player {
    * Builds an AudioResource for a track by streaming audio via yt-dlp.
    * Uses Node.js JS runtime for signature decryption (--js-runtimes node).
    * Tries multiple player clients (android, ios, tv_embedded, web).
+   * For JioSaavn tracks, streams directly from the provided audio URL.
+   * For YouTube tracks, tries Vercel relay first (bypasses IP blocks).
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
     const videoId = track.videoId || extractVideoId(url);
-    console.log(`[player] _createResource: "${track.title?.substring(0, 50)}" videoId="${videoId}"`);
+    console.log(`[player] _createResource: "${track.title?.substring(0, 50)}" videoId="${videoId}" source="${track.source}"`);
     console.log(`[player] track data: title="${track.title}" author="${track.author}" thumbnail="${track.thumbnail?.substring(0, 60)}" duration=${track.duration}`);
+
+    // JioSaavn tracks have direct audio URLs - no yt-dlp needed
+    if (track.source === 'jiosaavn' && track.audioUrl) {
+      console.log(`[player] streaming JioSaavn track directly: ${track.audioUrl}`);
+      return this._streamDirect(track.audioUrl, track);
+    }
+
+    // YouTube tracks: try Vercel relay first (bypasses IP blocks)
+    if (track.source === 'youtube' && isRelayEnabled() && videoId) {
+      console.log(`[player] trying Vercel relay for YouTube audio: ${videoId}`);
+      const relayUrl = await relayAudioStream(videoId);
+      if (relayUrl) {
+        console.log(`[player] Vercel relay stream URL obtained, streaming directly`);
+        return this._streamDirect(relayUrl, track);
+      }
+      console.log(`[player] Vercel relay failed, falling back to yt-dlp`);
+    }
 
     // Always enrich metadata to get the best data from yt-dlp
     try {
@@ -739,6 +815,103 @@ export class Player {
     // Strategy 1: yt-dlp with multiple client strategies + Node.js JS runtime
     console.log('[player] using yt-dlp with Node.js JS runtime...');
     return this._streamViaYtdlp(track, url);
+  }
+
+  /** Stream audio directly from a URL (for JioSaavn and other direct sources). */
+  async _streamDirect(audioUrl, track) {
+    try {
+      console.log(`[player] fetching JioSaavn audio: ${audioUrl.substring(0, 80)}...`);
+      const response = await fetch(audioUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      if (!response.body) {
+        throw new Error('No response body from JioSaavn');
+      }
+
+      console.log(`[player] JioSaavn response: status=${response.status} contentType=${response.headers.get('content-type')} size=${response.headers.get('content-length')}`);
+
+      // Buffer some data first to ensure the stream is valid
+      const { Readable } = await import('node:stream');
+      const reader = response.body.getReader();
+      const firstChunk = await reader.read();
+      if (firstChunk.done || !firstChunk.value) {
+        throw new Error('JioSaavn stream returned no data');
+      }
+
+      console.log(`[player] JioSaavn stream started, first chunk: ${firstChunk.value.length} bytes`);
+
+      const stream = new Readable({
+        read() {
+          reader.read().then(({ done, value }) => {
+            if (done) {
+              console.log('[player] JioSaavn stream ended');
+              this.push(null);
+            } else {
+              this.push(value);
+            }
+          }).catch(err => {
+            console.error('[player] JioSaavn stream read error:', err.message);
+            this.destroy(err);
+          });
+        },
+      });
+
+      // Push the first chunk we already read
+      stream.push(firstChunk.value);
+
+      stream.on('error', (err) => {
+        console.error('[player] JioSaavn stream error:', err.message);
+      });
+
+      const resource = createAudioResource(stream, {
+        inputType: StreamType.Arbitrary,
+        inlineVolume: true,
+        metadata: track,
+      });
+
+      console.log(`[player] JioSaavn direct stream resource created for "${track.title}"`);
+
+      resource.on('error', (err) => {
+        console.error(`[player] JioSaavn resource error: ${err.message}`);
+      });
+
+      resource.on('end', () => {
+        console.log(`[player] JioSaavn resource ended for "${track.title}"`);
+      });
+
+      return resource;
+    } catch (err) {
+      console.error(`[player] JioSaavn direct stream failed for "${track.title}": ${err.message}`);
+      // Fallback to YouTube search for this track
+      console.log(`[player] falling back to YouTube search for "${track.title}"`);
+      const { YouTube } = await import('youtube-sr');
+      const query = `${track.title} ${track.author}`.replace(/\s+/g, ' ').trim();
+      const results = await YouTube.search(query, { limit: 3, type: 'video' });
+      const video = results?.find(v => v?.id && v?.title && !v?.private);
+      if (video) {
+        const ytTrack = {
+          ...track,
+          title: video.title?.trim() ?? track.title,
+          url: video.url ?? `https://www.youtube.com/watch?v=${video.id}`,
+          videoId: video.id,
+          duration: (Number(video.duration) || 0) * 1000,
+          thumbnail: video.thumbnail?.url ?? track.thumbnail,
+          author: video.channel?.name?.trim() ?? track.author,
+          source: 'youtube',
+          audioUrl: null,
+        };
+        console.log(`[player] fallback to YouTube: "${ytTrack.title}"`);
+        return this._streamViaYtdlp(ytTrack, ytTrack.url);
+      }
+      throw err;
+    }
   }
 
   /** Stream audio using yt-dlp with multiple player client strategies. */
@@ -1282,11 +1455,13 @@ export class Player {
     const embed = new EmbedBuilder()
       .setColor(themeColor)
       .setAuthor({
-        name: t.source === 'spotify' ? 'Spotify → YouTube' : t.source === 'soundcloud' ? 'SoundCloud → YouTube' : 'YouTube',
+        name: t.source === 'spotify' ? 'Spotify → YouTube' : t.source === 'soundcloud' ? 'SoundCloud → YouTube' : t.source === 'jiosaavn' ? 'JioSaavn' : 'YouTube',
         iconURL: t.source === 'spotify'
           ? 'https://cdn-icons-png.flaticon.com/512/174/174869.png'
           : t.source === 'soundcloud'
           ? 'https://cdn-icons-png.flaticon.com/512/2111/2111615.png'
+          : t.source === 'jiosaavn'
+          ? 'https://c.saavncdn.com/images/jiosaavn-logo.png'
           : 'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
       })
       .setTitle(`🎶 ${truncate(t.title || 'Unknown Title', 200)}`)
@@ -1326,6 +1501,8 @@ export class Player {
       embed.setFooter({ text: `🎧 Originally from Spotify: ${truncate(t.spotifyTitle, 150)}` });
     } else if (t.soundcloudTitle) {
       embed.setFooter({ text: `🎧 Originally from SoundCloud: ${truncate(t.soundcloudTitle, 150)}` });
+    } else if (t.source === 'jiosaavn') {
+      embed.setFooter({ text: `🎧 JioSaavn · ${truncate(t.author ?? 'Unknown', 100)}` });
     } else {
       const loopLabel = this.loop === 'track' ? '🔂 Track' : this.loop === 'queue' ? '🔁 Queue' : '🔀 None';
       const queueInfo = `Queue: ${this.queue.length} track${this.queue.length !== 1 ? 's' : ''} up next`;

@@ -8,6 +8,7 @@ A modular Discord music bot built with Discord.js v14, supporting YouTube, Spoti
 - **YouTube**: URL playback and search queries via `@distube/ytdl-core` + `play-dl`
 - **Spotify**: Track, album, and playlist links — auto-resolved to YouTube streams
 - **SoundCloud**: Track and playlist links — auto-resolved to YouTube streams
+- **JioSaavn**: Track, album, and search — direct streaming (no YouTube needed)
 - **Per-server queue**: Independent queue per guild with pagination
 - **Loop modes**: off / track / queue (via code — extendable to slash command)
 - **Auto-leave**: Leaves voice channel 30s after all humans depart
@@ -100,7 +101,39 @@ SPOTIFY_CLIENT_SECRET=your_client_secret
 ```
 Without these, Spotify links fall back to embed-page scraping (still works, but less reliable).
 
-### 8. (Optional) YouTube Cookies
+### 8. (Optional) Vercel Relay — Bypass YouTube IP Blocks
+
+If YouTube blocks your hosting IP, deploy the Vercel relay to route requests through Vercel's edge network:
+
+1. **Deploy to Vercel:**
+```bash
+cd vercel-relay
+vercel deploy --prod
+```
+
+2. **Update `.env`:**
+```env
+VERCEL_RELAY_URL=https://your-project.vercel.app
+VERCEL_RELAY_KEY=your-secret-key  # optional
+```
+
+3. **What it covers:**
+- YouTube search queries (bypasses search blocks)
+- YouTube audio streaming (bypasses streaming blocks via Invidious)
+- Video metadata lookups
+
+### 9. (Optional) JioSaavn Support
+
+JioSaavn is an Indian music streaming service. The bot can search and play songs directly from JioSaavn:
+- **Search**: `/play <song name>` will search JioSaavn if no YouTube results are found
+- **Direct URL**: Paste a JioSaavn song or album URL directly
+- **No API key needed** — uses the public JioSaavn API
+
+Example JioSaavn URLs:
+- Song: `https://www.jiosaavn.com/song/kesariya/AgIAQyBeWlI`
+- Album: `https://www.jiosaavn.com/album/brahmastra/xq4v9ZFC9iA_`
+
+### 10. (Optional) YouTube Cookies
 
 To avoid YouTube rate limits, generate cookies:
 1. Log into YouTube in your browser
@@ -117,6 +150,8 @@ User runs /play <query>
         ├─ Spotify URL? ──► resolveSpotify() ──► fetch metadata ──► search YouTube per track
         │
         ├─ SoundCloud URL? ──► resolveSoundCloud() ──► yt-dlp metadata ──► search YouTube per track
+        │
+        ├─ JioSaavn URL / query? ──► resolveJioSaavn() ──► JioSaavn API ──► direct stream
         │
         └─ YouTube URL / text query ──► resolveYouTube() ──► play-dl search
                                        │

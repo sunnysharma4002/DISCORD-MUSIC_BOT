@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
+import { relaySearch, isRelayEnabled } from '../utils/vercel-relay.js';
 
 const _projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
@@ -25,6 +26,14 @@ function getYtdlpBin() {
   return { bin, pre };
 }
 
+const JIOSAAVN_API_BASE = 'https://jiosaavn-api.sharmaofficial.workers.dev/api';
+
+/**
+ * JioSaavn URL patterns.
+ */
+const JIOSAAVN_SONG_RE = /^https?:\/\/www\.jiosaavn\.com\/song\/[^/]+\/([a-zA-Z0-9]+)/;
+const JIOSAAVN_ALBUM_RE = /^https?:\/\/www\.jiosaavn\.com\/album\/[^/]+\/([a-zA-Z0-9_-]+)/;
+
 /**
  * Spotify → YouTube resolution.
  *
@@ -43,6 +52,10 @@ const MAX_PLAYLIST_TRACKS = 60;
 
 export function isSoundCloudURL(url) {
   return typeof url === 'string' && /^https?:\/\/(www\.)?soundcloud\.com\//i.test(url.trim());
+}
+
+export function isJioSaavnURL(url) {
+  return typeof url === 'string' && /^https?:\/\/www\.jiosaavn\.com\//i.test(url.trim());
 }
 
 export function isSpotifyURL(url) {
@@ -270,12 +283,15 @@ export async function resolveSpotify(rawUrl, requestedBy) {
         }
       }
     } catch (err) {
-      console.warn(`[spotify-api] fell back to embed scraper: ${err.message}`);
+      // 410 = playlist no longer accessible via API (private, deleted, or format changed)
+      // Silently fall back to embed scraper - this is expected behavior
+      console.log(`[spotify-api] using embed scraper for ${type} (API: ${err.message})`);
     }
   }
 
   /* Fall back to embed page scraping (no API key) ------------------ */
   if (items.length === 0) {
+    console.log(`[spotify] fetching ${type} metadata via embed page...`);
     const entity = await fetchSpotifyEntity(type, id);
 
     if (type === 'track') {
@@ -298,6 +314,7 @@ export async function resolveSpotify(rawUrl, requestedBy) {
     if (!playlistName) {
       playlistName = entity?.name ?? entity?.title ?? null;
     }
+    console.log(`[spotify] embed scraper found ${items.length} tracks in "${playlistName ?? 'unknown'}"`);
   }
 
   if (items.length === 0) {
@@ -342,7 +359,179 @@ export async function resolveSpotify(rawUrl, requestedBy) {
     throw new Error('Could not find any of those tracks on YouTube.');
   }
 
+  console.log(`[spotify] resolved ${tracks.length}/${items.length} tracks to YouTube (skipped: ${skipped})`);
   return { tracks, playlistName, skipped, truncated };
+}
+
+/* ------------------------------------------------------------------ */
+/* JioSaavn                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Resolves a JioSaavn URL or search query to playable tracks.
+ * JioSaavn provides direct audio URLs (no DRM), so we can stream directly.
+ * Returns { tracks, playlistName, skipped, truncated }.
+ */
+export async function resolveJioSaavn(rawQuery, requestedBy) {
+  const query = String(rawQuery ?? '').trim();
+  if (!query) throw new Error('Empty search query.');
+
+  /* JioSaavn song URL - extract song name and search ---------------- */
+  const songMatch = query.match(JIOSAAVN_SONG_RE);
+  if (songMatch) {
+    const songName = decodeURIComponent(songMatch[0].split('/song/')[1].split('/')[0]);
+    console.log(`[jiosaavn] song URL detected, searching for: "${songName}"`);
+    return resolveJioSaavnSearch(songName, requestedBy);
+  }
+
+  /* JioSaavn album URL - extract album name and search --------------- */
+  const albumMatch = query.match(JIOSAAVN_ALBUM_RE);
+  if (albumMatch) {
+    const albumName = decodeURIComponent(albumMatch[0].split('/album/')[1].split('/')[0]);
+    console.log(`[jiosaavn] album URL detected, searching for: "${albumName}"`);
+    // Search for the album and get its ID
+    const searchData = await fetchJioSaavn(`search?query=${encodeURIComponent(albumName)}&limit=5`);
+    const albums = searchData?.albums?.results ?? [];
+    if (albums.length === 0) {
+      throw new Error(`Could not find album "${albumName}" on JioSaavn.`);
+    }
+    return resolveJioSaavnAlbum(albums[0].id, requestedBy);
+  }
+
+  /* Plain search query or JioSaavn URL without match ----------------- */
+  if (isJioSaavnURL(query)) {
+    throw new Error('Could not parse that JioSaavn link. Make sure it\'s a valid song or album URL.');
+  }
+
+  return resolveJioSaavnSearch(query, requestedBy);
+}
+
+/** Searches JioSaavn API and returns the first matching song as a playable track. */
+async function resolveJioSaavnSearch(query, requestedBy) {
+  const data = await fetchJioSaavn(`search?query=${encodeURIComponent(query)}&limit=5`);
+
+  const songs = data?.songs?.results ?? data?.topQuery?.results ?? [];
+  if (!Array.isArray(songs) || songs.length === 0) {
+    throw new Error(`No JioSaavn results for **${query}**.`);
+  }
+
+  // Get the first song's full details including download URL
+  const song = await fetchJioSaavnSongDetails(songs[0].id);
+  if (!song) {
+    throw new Error(`Could not fetch details for "${songs[0].title}".`);
+  }
+
+  const track = jioSaavnToTrack(song, requestedBy);
+  return { tracks: [track], playlistName: null, skipped: 0, truncated: false };
+}
+
+/** Resolves a JioSaavn song ID to a playable track. */
+async function resolveJioSaavnSong(songId, requestedBy) {
+  const song = await fetchJioSaavnSongDetails(songId);
+  if (!song) {
+    throw new Error('Could not fetch that JioSaavn song.');
+  }
+
+  const track = jioSaavnToTrack(song, requestedBy);
+  return { tracks: [track], playlistName: null, skipped: 0, truncated: false };
+}
+
+/** Resolves a JioSaavn album ID to playable tracks. */
+async function resolveJioSaavnAlbum(albumId, requestedBy) {
+  const data = await fetchJioSaavn(`albums?id=${encodeURIComponent(albumId)}`);
+  if (!data) {
+    throw new Error('Could not fetch that JioSaavn album.');
+  }
+
+  const playlistName = data.name ?? 'JioSaavn album';
+  const songs = data.songs ?? [];
+  if (songs.length === 0) {
+    throw new Error('No tracks found in that JioSaavn album.');
+  }
+
+  const truncated = songs.length > MAX_PLAYLIST_TRACKS;
+  const slice = truncated ? songs.slice(0, MAX_PLAYLIST_TRACKS) : songs;
+
+  const tracks = [];
+  let skipped = 0;
+
+  // Album API already returns full song data including downloadUrl
+  // No need for individual API calls - much faster
+  for (const song of slice) {
+    try {
+      const track = jioSaavnToTrack(song, requestedBy);
+      if (track.audioUrl) {
+        tracks.push(track);
+      } else {
+        skipped++;
+      }
+    } catch (err) {
+      console.warn(`[jiosaavn] failed to process song ${song.id}: ${err.message}`);
+      skipped++;
+    }
+  }
+
+  if (tracks.length === 0) {
+    throw new Error('Could not fetch any tracks from that JioSaavn album.');
+  }
+
+  return { tracks, playlistName, skipped, truncated };
+}
+
+/** Fetches a JioSaavn API endpoint and returns parsed JSON. */
+async function fetchJioSaavn(path) {
+  const url = `${JIOSAAVN_API_BASE}/${path}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`JioSaavn API returned HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data.success) {
+    throw new Error(data.message ?? 'JioSaavn API error');
+  }
+  return data.data;
+}
+
+/** Fetches full song details (including download URL) by song ID. */
+async function fetchJioSaavnSongDetails(songId) {
+  try {
+    const data = await fetchJioSaavn(`songs/${encodeURIComponent(songId)}`);
+    if (Array.isArray(data) && data.length > 0) return data[0];
+    return data;
+  } catch (err) {
+    console.warn(`[jiosaavn] song details failed for ${songId}: ${err.message}`);
+    return null;
+  }
+}
+
+/** Converts a JioSaavn song object to a playable track. */
+function jioSaavnToTrack(song, requestedBy) {
+  const downloadUrls = song.downloadUrl ?? [];
+  // Prefer 320kbps, fallback to 160kbps, then any available
+  const bestUrl = downloadUrls.find(d => d.quality === '320kbps')
+    ?? downloadUrls.find(d => d.quality === '160kbps')
+    ?? downloadUrls[0];
+
+  const primaryArtists = song.artists?.primary ?? [];
+  const author = primaryArtists.map(a => a.name).filter(Boolean).join(', ') || 'Unknown';
+
+  const image = song.image ?? [];
+  const thumbnail = image.find(i => i.quality === '500x500')?.url
+    ?? image.find(i => i.quality === '150x150')?.url
+    ?? null;
+
+  return {
+    title: song.name ?? song.title ?? 'Unknown',
+    url: song.url ?? `https://www.jiosaavn.com/song/${song.id}`,
+    videoId: song.id,
+    duration: (song.duration ?? 0) * 1000,
+    isLive: false,
+    thumbnail,
+    author,
+    source: 'jiosaavn',
+    audioUrl: bestUrl?.url ?? null,
+    requestedBy,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -487,8 +676,29 @@ function readSoundCloudItem(item) {
 /** Runs a YouTube search and returns the first usable video, or null. */
 async function searchYouTube(query) {
   const apiKey = process.env.YOUTUBE_API_KEY?.trim();
-  console.log(`[resolver] searchYouTube: query="${query.substring(0, 50)}" apiKey=${apiKey ? 'set' : 'missing'}`);
+  console.log(`[resolver] searchYouTube: query="${query.substring(0, 50)}" apiKey=${apiKey ? 'set' : 'missing'} relay=${isRelayEnabled() ? 'enabled' : 'disabled'}`);
 
+  // Strategy 1: Vercel Relay (bypasses IP blocks)
+  if (isRelayEnabled()) {
+    const relayResults = await relaySearch(query, 5);
+    if (relayResults && relayResults.length > 0) {
+      const video = relayResults[0];
+      console.log(`[resolver] relay search found: "${video.title?.substring(0, 50)}"`);
+      return {
+        title: video.title || 'Unknown title',
+        url: video.url || `https://www.youtube.com/watch?v=${video.id}`,
+        videoId: video.id,
+        duration: (Number(video.duration) || 0) * 1000,
+        isLive: Boolean(video.isLive),
+        thumbnail: video.thumbnail || `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
+        author: video.author || 'Unknown',
+        source: 'youtube',
+      };
+    }
+    console.log('[resolver] relay search returned no results');
+  }
+
+  // Strategy 2: YouTube Data API v3
   if (apiKey) {
     const video = await searchYouTubeAPI(query, apiKey);
     if (video) {
@@ -498,6 +708,7 @@ async function searchYouTube(query) {
     console.log('[resolver] API search returned no results');
   }
 
+  // Strategy 3: youtube-sr (direct, may be blocked)
   console.log('[resolver] falling back to youtube-sr');
   const results = await YouTube.search(query, { limit: 5, type: 'video', safeSearch: false });
   if (!Array.isArray(results)) return null;
@@ -787,7 +998,7 @@ export async function resolveYouTube(rawQuery, requestedBy) {
 
   /* Other URLs are unsupported ------------------------------------ */
   if (isURL(query)) {
-    throw new Error('Only YouTube, Spotify, and SoundCloud links are supported.');
+    throw new Error('Only YouTube, Spotify, SoundCloud, and JioSaavn links are supported.');
   }
 
   /* Plain search query ------------------------------------------- */
@@ -828,5 +1039,6 @@ export async function resolveQuery(query, requestedBy) {
 
   if (isSpotifyURL(trimmed)) return resolveSpotify(trimmed, requestedBy);
   if (isSoundCloudURL(trimmed)) return resolveSoundCloud(trimmed, requestedBy);
+  if (isJioSaavnURL(trimmed)) return resolveJioSaavn(trimmed, requestedBy);
   return resolveYouTube(trimmed, requestedBy);
 }
