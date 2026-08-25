@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
-import { relaySearch, isRelayEnabled } from '../utils/vercel-relay.js';
+import { relaySearch, isRelayEnabled } from '../utils/relay.js';
 
 const _projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
