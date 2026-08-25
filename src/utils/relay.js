@@ -64,54 +64,44 @@ export async function relaySearch(query, limit = 5) {
   if (!ENABLED) return null;
 
   try {
+    // Try API search endpoint first (fast, structured JSON, immune to CAPTCHAs)
+    const url = new URL(`${RELAY_URL}/api/search`);
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', String(limit));
+
+    const res = await fetch(url.toString(), {
+      headers: buildRelayHeaders(),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data.results && data.results.length > 0) {
+        console.log(`[relay] search via ${RELAY_TYPE}: ${data.results.length} results for "${query.substring(0, 40)}"`);
+        return data.results.slice(0, limit);
+      }
+    }
+
+    // Fallback for older generic proxy relays
     if (IS_CLOUDFLARE) {
-      // Cloudflare: proxy to YouTube search
       const targetUrl = 'https://www.youtube.com';
       const path = `/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%253D%253D`;
 
-      const res = await relayRequest(targetUrl, path, {
+      const pRes = await relayRequest(targetUrl, path, {
         signal: AbortSignal.timeout(10_000),
       });
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] search HTTP ${res.status}: ${text.substring(0, 200)}`);
-        return null;
+      if (pRes.ok) {
+        const html = await pRes.text();
+        const results = parseYouTubeSearchHTML(html);
+        if (results.length > 0) {
+          console.log(`[relay] search HTML via ${RELAY_TYPE}: ${results.length} results for "${query.substring(0, 40)}"`);
+          return results.slice(0, limit);
+        }
       }
-
-      const html = await res.text();
-      const results = parseYouTubeSearchHTML(html);
-
-      if (results.length === 0) {
-        console.log('[relay] no search results found');
-        return null;
-      }
-
-      console.log(`[relay] search via ${RELAY_TYPE}: ${results.length} results for "${query.substring(0, 40)}"`);
-      return results.slice(0, limit);
-    } else {
-      // Vercel: direct endpoint
-      const url = new URL(`${RELAY_URL}/api/search`);
-      url.searchParams.set('q', query);
-      url.searchParams.set('limit', String(limit));
-
-      const res = await fetch(url.toString(), {
-        headers: buildRelayHeaders(),
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] search HTTP ${res.status}: ${text.substring(0, 200)}`);
-        return null;
-      }
-
-      const data = await res.json();
-      if (!data.results || data.results.length === 0) return null;
-
-      console.log(`[relay] search via ${RELAY_TYPE}: ${data.results.length} results for "${query.substring(0, 40)}"`);
-      return data.results;
     }
+
+    return null;
   } catch (err) {
     console.warn(`[relay] search failed: ${err.message}`);
     return null;
@@ -123,45 +113,38 @@ export async function relayVideoInfo(videoId) {
   if (!ENABLED) return null;
 
   try {
-    if (IS_CLOUDFLARE) {
-      const targetUrl = 'https://www.youtube.com';
-      const path = `/watch?v=${videoId}`;
+    const url = new URL(`${RELAY_URL}/api/video-info`);
+    url.searchParams.set('id', videoId);
 
-      const res = await relayRequest(targetUrl, path, {
-        signal: AbortSignal.timeout(8_000),
-      });
+    const res = await fetch(url.toString(), {
+      headers: buildRelayHeaders(),
+      signal: AbortSignal.timeout(8_000),
+    });
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] video-info HTTP ${res.status}: ${text.substring(0, 200)}`);
-        return null;
-      }
-
-      const html = await res.text();
-      const title = parseYouTubeTitle(html);
-      const author = parseYouTubeAuthor(html);
-
-      console.log(`[relay] video-info via ${RELAY_TYPE}: "${title?.substring(0, 50)}"`);
-      return { title, author };
-    } else {
-      const url = new URL(`${RELAY_URL}/api/video-info`);
-      url.searchParams.set('id', videoId);
-
-      const res = await fetch(url.toString(), {
-        headers: buildRelayHeaders(),
-        signal: AbortSignal.timeout(8_000),
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] video-info HTTP ${res.status}: ${text.substring(0, 200)}`);
-        return null;
-      }
-
+    if (res.ok) {
       const data = await res.json();
       console.log(`[relay] video-info via ${RELAY_TYPE}: "${data.title?.substring(0, 50)}"`);
       return data;
     }
+
+    if (IS_CLOUDFLARE) {
+      const targetUrl = 'https://www.youtube.com';
+      const path = `/watch?v=${videoId}`;
+
+      const pRes = await relayRequest(targetUrl, path, {
+        signal: AbortSignal.timeout(8_000),
+      });
+
+      if (pRes.ok) {
+        const html = await pRes.text();
+        const title = parseYouTubeTitle(html);
+        const author = parseYouTubeAuthor(html);
+        console.log(`[relay] video-info HTML via ${RELAY_TYPE}: "${title?.substring(0, 50)}"`);
+        return { title, author };
+      }
+    }
+
+    return null;
   } catch (err) {
     console.warn(`[relay] video-info failed: ${err.message}`);
     return null;
