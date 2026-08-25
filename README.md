@@ -119,8 +119,10 @@ VERCEL_RELAY_KEY=your-secret-key  # optional
 
 3. **What it covers:**
 - YouTube search queries (bypasses search blocks)
-- YouTube audio streaming (bypasses streaming blocks via Invidious)
+- YouTube audio streaming (bypasses streaming blocks)
 - Video metadata lookups
+
+The relay uses `youtubei.js` (YouTube's official API client) to fetch data from Vercel's IP instead of your bot's IP.
 
 ### 9. (Optional) JioSaavn Support
 

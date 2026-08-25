@@ -1,12 +1,14 @@
 # Vercel Relay
 
-Routes YouTube search and audio streaming through Vercel's edge network to bypass IP blocks.
+Routes YouTube search and audio streaming through Vercel using `youtubei.js` (pure JS YouTube client).
 
 ## What it does
 
 - **Search**: Proxies YouTube search queries through Vercel (bypasses search IP blocks)
-- **Streaming**: Gets audio stream URLs from Invidious instances (bypasses streaming IP blocks)
+- **Streaming**: Gets YouTube audio URLs through Vercel (bypasses streaming IP blocks)
 - **Metadata**: Fetches video info through Vercel
+
+All requests to YouTube come from Vercel's IP addresses, not your bot's server IP.
 
 ## Deploy
 
@@ -37,7 +39,7 @@ VERCEL_RELAY_KEY=your-secret-key
 Search YouTube videos.
 
 ```
-?query=Kesariya&limit=5
+?q=Kesariya&limit=5
 ```
 
 Response:
@@ -67,34 +69,33 @@ Get video metadata.
 Get audio stream URL for a video.
 
 ```
-?id=videoId&format=audio
+?id=videoId
 ```
 
 Response:
 ```json
 {
-  "streamUrl": "https://invidious-instance.com/api/manifest/...",
+  "streamUrl": "https://rr5---sn-...",
   "mimeType": "audio/mp4",
   "bitrate": 128000,
-  "source": "invidious"
+  "source": "youtube"
 }
 ```
 
 ## How it works
 
 1. Bot requests search/stream through Vercel relay
-2. Vercel uses Invidious instances (YouTube frontends) to fetch data
-3. Invidious URLs are not IP-restricted like YouTube's direct URLs
-4. Bot streams through Vercel/Invidious instead of YouTube directly
+2. Vercel uses `youtubei.js` (YouTube's own API) to fetch data
+3. YouTube sees Vercel's IP, not your bot's IP
+4. Bot streams directly using the URL from Vercel
 
-## Invidious instances
+## Why youtubei.js?
 
-The relay tries multiple public Invidious instances:
-- invidious.fdn.fr
-- invidious.io.lol
-- yewtu.be
-- inv.tux.pizza
-- vid.puffyan.us
-- invidious.flokinet.to
+- Pure JavaScript — works in Vercel serverless functions
+- Uses YouTube's official API (no scraping)
+- No child processes needed
+- More reliable than yt-dlp on serverless
 
-If one is down, it falls back to the next.
+## Dependencies
+
+- `youtubei.js` — YouTube's internal API client (pure JS)

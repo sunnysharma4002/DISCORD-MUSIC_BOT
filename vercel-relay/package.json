@@ -1,9 +1,10 @@
 {
   "name": "vercel-relay",
   "version": "1.0.0",
-  "description": "Vercel relay for YouTube search and metadata (bypasses IP blocks)",
+  "description": "Vercel relay for YouTube search and streaming using youtubei.js (bypasses IP blocks)",
   "private": true,
+  "type": "module",
   "dependencies": {
-    "youtube-sr": "^4.3.11"
+    "youtubei.js": "^13.0.0"
   }
 }

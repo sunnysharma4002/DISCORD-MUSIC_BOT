@@ -11,6 +11,8 @@ const ENABLED = Boolean(RELAY_URL);
 
 if (ENABLED) {
   console.log(`[relay] Vercel relay enabled: ${RELAY_URL}`);
+} else {
+  console.log('[relay] Vercel relay disabled (set VERCEL_RELAY_URL to enable)');
 }
 
 /** Search YouTube via the Vercel relay. Returns array of video objects or null. */
@@ -25,9 +27,12 @@ export async function relaySearch(query, limit = 5) {
     const headers = { 'Content-Type': 'application/json' };
     if (RELAY_KEY) headers['X-Relay-Key'] = RELAY_KEY;
 
+    console.log(`[relay] searching: ${url.toString()}`);
     const res = await fetch(url.toString(), { headers, signal: AbortSignal.timeout(10_000) });
+
     if (!res.ok) {
-      console.warn(`[relay] search HTTP ${res.status}`);
+      const text = await res.text().catch(() => 'unknown');
+      console.warn(`[relay] search HTTP ${res.status}: ${text.substring(0, 200)}`);
       return null;
     }
 
@@ -55,7 +60,8 @@ export async function relayVideoInfo(videoId) {
 
     const res = await fetch(url.toString(), { headers, signal: AbortSignal.timeout(8_000) });
     if (!res.ok) {
-      console.warn(`[relay] video-info HTTP ${res.status}`);
+      const text = await res.text().catch(() => 'unknown');
+      console.warn(`[relay] video-info HTTP ${res.status}: ${text.substring(0, 200)}`);
       return null;
     }
 
@@ -84,19 +90,22 @@ export async function relayAudioStream(videoId) {
     const headers = { 'Content-Type': 'application/json' };
     if (RELAY_KEY) headers['X-Relay-Key'] = RELAY_KEY;
 
+    console.log(`[relay] requesting stream for: ${videoId}`);
     const res = await fetch(url.toString(), { headers, signal: AbortSignal.timeout(15_000) });
+
     if (!res.ok) {
-      console.warn(`[relay] stream HTTP ${res.status}`);
+      const text = await res.text().catch(() => 'unknown');
+      console.warn(`[relay] stream HTTP ${res.status}: ${text.substring(0, 300)}`);
       return null;
     }
 
     const data = await res.json();
     if (!data.streamUrl) {
-      console.warn('[relay] no streamUrl in response');
+      console.warn(`[relay] no streamUrl in response: ${JSON.stringify(data).substring(0, 200)}`);
       return null;
     }
 
-    console.log(`[relay] got stream URL for ${videoId}: ${data.streamUrl.substring(0, 80)}...`);
+    console.log(`[relay] got stream URL for ${videoId} via ${data.instance || 'invidious'}: ${data.mimeType || 'audio'} ${data.bitrate ? `${Math.round(data.bitrate/1000)}kbps` : ''}`);
     return data.streamUrl;
   } catch (err) {
     console.warn(`[relay] stream URL fetch failed: ${err.message}`);
