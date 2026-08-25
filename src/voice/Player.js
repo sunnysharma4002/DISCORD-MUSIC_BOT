@@ -1282,9 +1282,11 @@ export class Player {
     const embed = new EmbedBuilder()
       .setColor(themeColor)
       .setAuthor({
-        name: t.source === 'spotify' ? 'Spotify → YouTube' : 'YouTube',
+        name: t.source === 'spotify' ? 'Spotify → YouTube' : t.source === 'soundcloud' ? 'SoundCloud → YouTube' : 'YouTube',
         iconURL: t.source === 'spotify'
           ? 'https://cdn-icons-png.flaticon.com/512/174/174869.png'
+          : t.source === 'soundcloud'
+          ? 'https://cdn-icons-png.flaticon.com/512/2111/2111615.png'
           : 'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
       })
       .setTitle(`🎶 ${truncate(t.title || 'Unknown Title', 200)}`)
@@ -1322,6 +1324,8 @@ export class Player {
 
     if (t.spotifyTitle) {
       embed.setFooter({ text: `🎧 Originally from Spotify: ${truncate(t.spotifyTitle, 150)}` });
+    } else if (t.soundcloudTitle) {
+      embed.setFooter({ text: `🎧 Originally from SoundCloud: ${truncate(t.soundcloudTitle, 150)}` });
     } else {
       const loopLabel = this.loop === 'track' ? '🔂 Track' : this.loop === 'queue' ? '🔁 Queue' : '🔀 None';
       const queueInfo = `Queue: ${this.queue.length} track${this.queue.length !== 1 ? 's' : ''} up next`;

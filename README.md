@@ -1,12 +1,13 @@
 # Discord Music Bot
 
-A modular Discord music bot built with Discord.js v14, supporting YouTube and Spotify sources.
+A modular Discord music bot built with Discord.js v14, supporting YouTube, Spotify, and SoundCloud sources.
 
 ## Features
 
 - **Slash Commands**: `/play`, `/skip`, `/stop`, `/pause`, `/resume`, `/queue`, `/nowplaying`
 - **YouTube**: URL playback and search queries via `@distube/ytdl-core` + `play-dl`
 - **Spotify**: Track, album, and playlist links — auto-resolved to YouTube streams
+- **SoundCloud**: Track and playlist links — auto-resolved to YouTube streams
 - **Per-server queue**: Independent queue per guild with pagination
 - **Loop modes**: off / track / queue (via code — extendable to slash command)
 - **Auto-leave**: Leaves voice channel 30s after all humans depart
@@ -87,7 +88,19 @@ You should see:
 [INFO]  Slash commands registered.
 ```
 
-### 7. (Optional) YouTube Cookies
+### 7. (Optional) Spotify API Credentials
+
+For more reliable Spotify metadata resolution, add Spotify API credentials:
+1. Go to https://developer.spotify.com/dashboard
+2. Create a new app
+3. Copy the Client ID and Client Secret into `.env`:
+```
+SPOTIFY_CLIENT_ID=your_client_id
+SPOTIFY_CLIENT_SECRET=your_client_secret
+```
+Without these, Spotify links fall back to embed-page scraping (still works, but less reliable).
+
+### 8. (Optional) YouTube Cookies
 
 To avoid YouTube rate limits, generate cookies:
 1. Log into YouTube in your browser
@@ -101,9 +114,11 @@ See: https://github.com/play-dl/play_dl/blob/master/play-dl/YouTube/README.md#us
 ```
 User runs /play <query>
        │
-       ├─ Spotify URL? ──► resolveSpotify() ──► fetch metadata ──► search YouTube per track
-       │
-       └─ YouTube URL / text query ──► resolveYouTube() ──► play-dl search
+        ├─ Spotify URL? ──► resolveSpotify() ──► fetch metadata ──► search YouTube per track
+        │
+        ├─ SoundCloud URL? ──► resolveSoundCloud() ──► yt-dlp metadata ──► search YouTube per track
+        │
+        └─ YouTube URL / text query ──► resolveYouTube() ──► play-dl search
                                        │
                                        ▼
                             Track object: { title, url, duration, thumbnail, isLive, source }

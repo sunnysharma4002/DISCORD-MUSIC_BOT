@@ -41,6 +41,10 @@ const SPOTIFY_RE =
 
 const MAX_PLAYLIST_TRACKS = 60;
 
+export function isSoundCloudURL(url) {
+  return typeof url === 'string' && /^https?:\/\/(www\.)?soundcloud\.com\//i.test(url.trim());
+}
+
 export function isSpotifyURL(url) {
   return typeof url === 'string' && SPOTIFY_RE.test(url.trim());
 }
@@ -60,7 +64,108 @@ export function isURL(str) {
 /* Spotify                                                             */
 /* ------------------------------------------------------------------ */
 
-/** Fetches the embed page and extracts the JSON state object. */
+/**
+ * Spotify API access token cache.
+ * Tokens last 1 hour; we refresh at 50 minutes to be safe.
+ */
+let _spotifyToken = null;
+let _spotifyTokenExpiry = 0;
+
+/**
+ * Gets a Spotify API access token using client credentials.
+ * Returns null if credentials are not configured.
+ */
+async function getSpotifyToken() {
+  const clientId = process.env.SPOTIFY_CLIENT_ID?.trim();
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET?.trim();
+
+  if (!clientId || !clientSecret) return null;
+
+  const now = Date.now();
+  if (_spotifyToken && now < _spotifyTokenExpiry) {
+    return _spotifyToken;
+  }
+
+  try {
+    const res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    if (!res.ok) {
+      console.warn(`[spotify-api] token request failed: HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    _spotifyToken = data.access_token;
+    _spotifyTokenExpiry = now + (data.expires_in - 300) * 1000;
+    console.log('[spotify-api] obtained access token');
+    return _spotifyToken;
+  } catch (err) {
+    console.warn(`[spotify-api] token error: ${err.message}`);
+    return null;
+  }
+}
+
+/** Fetches track/album/playlist data from the Spotify Web API. */
+async function fetchSpotifyAPI(type, id, token) {
+  const url = `https://api.spotify.com/v1/${type}/${id}`;
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Spotify API returned HTTP ${res.status} for that ${type}.`);
+  }
+
+  return res.json();
+}
+
+/** Fetches playlist tracks (paginated) from the Spotify Web API. */
+async function fetchPlaylistTracksAPI(playlistId, token) {
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&fields=items(track(name,artists)),next`;
+
+  while (url) {
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+
+    if (!res.ok) {
+      throw new Error(`Spotify API returned HTTP ${res.status} for playlist tracks.`);
+    }
+
+    const data = await res.json();
+    for (const item of data.items ?? []) {
+      if (item.track) tracks.push(item.track);
+    }
+
+    url = data.next;
+  }
+
+  return tracks;
+}
+
+/** Normalises one Spotify API track into { name, artist }. */
+function readAPIItem(track) {
+  if (!track) return null;
+  const name = track.name ?? null;
+  if (!name) return null;
+
+  const artists = track.artists ?? [];
+  const artist = Array.isArray(artists)
+    ? artists.map(a => a?.name ?? '').filter(Boolean).join(', ')
+    : '';
+
+  return { name: String(name), artist: String(artist ?? '') };
+}
+
+/** Fetches the embed page and extracts the JSON state object (fallback). */
 async function fetchSpotifyEntity(type, id) {
   const url = `https://open.spotify.com/embed/${type}/${id}`;
   const res = await fetch(url, {
@@ -128,7 +233,7 @@ function readItem(item) {
 
 /**
  * Resolves a Spotify URL to an array of playable YouTube tracks.
- * Returns { tracks, playlistName, skipped }.
+ * Returns { tracks, playlistName, skipped, truncated }.
  */
 export async function resolveSpotify(rawUrl, requestedBy) {
   const url = String(rawUrl).trim();
@@ -136,25 +241,62 @@ export async function resolveSpotify(rawUrl, requestedBy) {
   if (!match) throw new Error('That is not a valid Spotify track/album/playlist link.');
 
   const [, type, id] = match;
-  const entity = await fetchSpotifyEntity(type, id);
 
-  /* Collect raw Spotify items ------------------------------------- */
+  /* Try Spotify API first (if credentials are set) ------------------ */
+  const token = await getSpotifyToken();
   let items = [];
+  let playlistName = null;
 
-  if (type === 'track') {
-    const single = readItem(entity);
-    if (single) items = [single];
-  } else {
-    const list =
-      entity?.trackList ??
-      entity?.tracks?.items ??
-      entity?.tracks ??
-      [];
+  if (token) {
+    try {
+      const entity = await fetchSpotifyAPI(type, id, token);
 
-    for (const raw of list) {
-      // playlist entries sometimes nest the track under .track
-      const parsed = readItem(raw?.track ?? raw);
-      if (parsed) items.push(parsed);
+      if (type === 'track') {
+        const single = readAPIItem(entity);
+        if (single) items = [single];
+      } else if (type === 'album') {
+        playlistName = entity?.name ?? null;
+        const albumTracks = entity?.tracks?.items ?? [];
+        for (const raw of albumTracks) {
+          const parsed = readAPIItem(raw);
+          if (parsed) items.push(parsed);
+        }
+      } else if (type === 'playlist') {
+        playlistName = entity?.name ?? null;
+        const playlistTracks = await fetchPlaylistTracksAPI(id, token);
+        for (const raw of playlistTracks) {
+          const parsed = readAPIItem(raw);
+          if (parsed) items.push(parsed);
+        }
+      }
+    } catch (err) {
+      console.warn(`[spotify-api] fell back to embed scraper: ${err.message}`);
+    }
+  }
+
+  /* Fall back to embed page scraping (no API key) ------------------ */
+  if (items.length === 0) {
+    const entity = await fetchSpotifyEntity(type, id);
+
+    if (type === 'track') {
+      const single = readItem(entity);
+      if (single) items = [single];
+    } else {
+      const list =
+        entity?.trackList ??
+        entity?.tracks?.items ??
+        entity?.tracks ??
+        [];
+
+      for (const raw of list) {
+        // playlist entries sometimes nest the track under .track
+        const parsed = readItem(raw?.track ?? raw);
+        if (parsed) items.push(parsed);
+      }
+    }
+
+    if (!playlistName) {
+      playlistName = entity?.name ?? entity?.title ?? null;
     }
   }
 
@@ -162,7 +304,6 @@ export async function resolveSpotify(rawUrl, requestedBy) {
     throw new Error('No tracks found in that Spotify link.');
   }
 
-  const playlistName = entity?.name ?? entity?.title ?? null;
   const truncated = items.length > MAX_PLAYLIST_TRACKS;
   if (truncated) items = items.slice(0, MAX_PLAYLIST_TRACKS);
 
@@ -202,6 +343,141 @@ export async function resolveSpotify(rawUrl, requestedBy) {
   }
 
   return { tracks, playlistName, skipped, truncated };
+}
+
+/* ------------------------------------------------------------------ */
+/* SoundCloud                                                          */
+/* ------------------------------------------------------------------ */
+
+const SOUNDCLOUD_RE = /^https?:\/\/(www\.)?soundcloud\.com\/(.+)/;
+
+/**
+ * Resolves a SoundCloud URL to an array of playable YouTube tracks.
+ * Uses yt-dlp to extract SoundCloud metadata (no API key needed),
+ * then searches YouTube for matching streams.
+ * Returns { tracks, playlistName, skipped, truncated }.
+ */
+export async function resolveSoundCloud(rawUrl, requestedBy) {
+  const url = String(rawUrl).trim();
+  const match = url.match(SOUNDCLOUD_RE);
+  if (!match) throw new Error('That is not a valid SoundCloud link.');
+
+  const { bin, pre } = getYtdlpBin();
+  if (!existsSync(bin)) {
+    throw new Error('yt-dlp is not installed — required for SoundCloud support.');
+  }
+
+  // Fetch metadata via yt-dlp
+  const metadata = await new Promise((resolve, reject) => {
+    const args = [
+      ...pre,
+      '-J',
+      '--no-playlist',
+      '--flat-playlist',
+      '--dump-json',
+      '--no-warnings',
+      '--extractor-retries', '3',
+      url,
+    ];
+
+    let stdout = '';
+    let stderr = '';
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0 || !stdout.trim()) {
+        reject(new Error(stderr.trim().slice(0, 200) || `yt-dlp exited ${code}`));
+        return;
+      }
+      try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+    });
+
+    setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch {}
+      reject(new Error('SoundCloud metadata fetch timed out after 15s.'));
+    }, 15000);
+  });
+
+  /* Collect items ------------------------------------------------ */
+  let items = [];
+  let playlistName = null;
+
+  if (metadata.entries && Array.isArray(metadata.entries)) {
+    // Playlist or album
+    playlistName = metadata.title ?? 'SoundCloud playlist';
+    for (const entry of metadata.entries) {
+      const parsed = readSoundCloudItem(entry);
+      if (parsed) items.push(parsed);
+    }
+  } else if (metadata.title) {
+    // Single track
+    const parsed = readSoundCloudItem(metadata);
+    if (parsed) items = [parsed];
+  }
+
+  if (items.length === 0) {
+    throw new Error('No tracks found in that SoundCloud link.');
+  }
+
+  const truncated = items.length > MAX_PLAYLIST_TRACKS;
+  if (truncated) items = items.slice(0, MAX_PLAYLIST_TRACKS);
+
+  /* Search YouTube for each item --------------------------------- */
+  const tracks = [];
+  let skipped = 0;
+
+  for (const item of items) {
+    const query = `${item.name} ${item.artist}`.replace(/\s+/g, ' ').trim();
+    if (!query) {
+      skipped++;
+      continue;
+    }
+
+    try {
+      const video = await searchYouTube(query);
+      if (!video) {
+        skipped++;
+        continue;
+      }
+      tracks.push({
+        ...video,
+        source: 'soundcloud',
+        title: video.title,
+        soundcloudTitle: `${item.name}${item.artist ? ` — ${item.artist}` : ''}`,
+        soundcloudUrl: item.url,
+        requestedBy,
+      });
+    } catch (err) {
+      console.warn(`[soundcloud] search failed for "${query}": ${err.message}`);
+      skipped++;
+    }
+  }
+
+  if (tracks.length === 0) {
+    throw new Error('Could not find any of those tracks on YouTube.');
+  }
+
+  return { tracks, playlistName, skipped, truncated };
+}
+
+/** Normalises one SoundCloud entity into { name, artist, url }. */
+function readSoundCloudItem(item) {
+  if (!item) return null;
+  const name = item.title ?? item.track?.title ?? null;
+  if (!name) return null;
+
+  const artist = item.uploader ?? item.artist ?? item.creator ?? item.channel ?? item.subtitle ?? '';
+  const trackUrl = item.url ?? (item.webpage_url ? item.webpage_url : null);
+
+  return {
+    name: String(name).trim(),
+    artist: String(artist || '').trim(),
+    url: trackUrl,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +787,7 @@ export async function resolveYouTube(rawQuery, requestedBy) {
 
   /* Other URLs are unsupported ------------------------------------ */
   if (isURL(query)) {
-    throw new Error('Only YouTube and Spotify links are supported.');
+    throw new Error('Only YouTube, Spotify, and SoundCloud links are supported.');
   }
 
   /* Plain search query ------------------------------------------- */
@@ -551,5 +827,6 @@ export async function resolveQuery(query, requestedBy) {
   if (!trimmed) throw new Error('You need to provide a song name or link.');
 
   if (isSpotifyURL(trimmed)) return resolveSpotify(trimmed, requestedBy);
+  if (isSoundCloudURL(trimmed)) return resolveSoundCloud(trimmed, requestedBy);
   return resolveYouTube(trimmed, requestedBy);
 }

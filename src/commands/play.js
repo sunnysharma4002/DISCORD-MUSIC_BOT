@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
-import { resolveQuery, isSpotifyURL } from '../spotify/resolver.js';
+import { resolveQuery, isSpotifyURL, isSoundCloudURL } from '../spotify/resolver.js';
 
 export default {
   data: new SlashCommandBuilder()
@@ -128,7 +128,7 @@ export default {
           { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
           { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
           { name: '📍 Position', value: 'Playing now', inline: true },
-          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube', inline: true },
+          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : 'YouTube', inline: true },
           { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
         );
       if (t.thumbnail && t.thumbnail.startsWith('http')) {
@@ -146,7 +146,7 @@ export default {
       console.log(`[play] control panel created with buttons, message id=${reply.id}`);
     } else {
       // Added to queue - show queue style embed
-      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
+      const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : isSoundCloudURL(query) ? 'SoundCloud → YouTube' : 'YouTube';
       const embed = new EmbedBuilder().setColor(0x57f287);
 
       if (tracks.length === 1) {
