@@ -1,5 +1,10 @@
 process.env.DEBUG = 'discord-voice*';
 
+import dns from 'node:dns';
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
+
 import { Client, GatewayIntentBits, Collection, ActivityType, MessageFlags } from 'discord.js';
 import { generateDependencyReport, AudioPlayerStatus } from '@discordjs/voice';
 import { Player } from './voice/Player.js';

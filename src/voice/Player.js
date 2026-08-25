@@ -359,9 +359,6 @@ export class Player {
       console.error(`[voice] connection error (code ${code ?? '?'}):`, msg);
     });
 
-    connection.subscribe(this.audioPlayer);
-    console.log(`[voice] audioPlayer subscribed to connection (guild: ${this.guildId})`);
-
     // Log every state transition — tells us WHERE it gets stuck.
     //   Signalling → Connecting → Ready   = healthy
     //   stuck in Signalling               = voice server update never arrived (gateway)
@@ -392,9 +389,9 @@ export class Player {
         lastStateChange = now;
 
         console.log(`[voice] state: ${oldState.status} → ${newState.status}`);
-        // Re-subscribe on Ready to ensure audio pipe is connected
+        // Subscribe on Ready to ensure audio pipe is connected
         if (newState.status === VoiceConnectionStatus.Ready) {
-          console.log(`[voice] re-subscribing audioPlayer`);
+          console.log(`[voice] audioPlayer subscribed to connection (guild: ${this.guildId})`);
           connection.subscribe(this.audioPlayer);
         }
       }
@@ -435,8 +432,6 @@ export class Player {
       }
     });
 
-    connection.subscribe(this.audioPlayer);
-
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 60_000);
     } catch {
@@ -454,8 +449,7 @@ export class Player {
       }
       throw new Error(
         lastState === VoiceConnectionStatus.Connecting || lastState === VoiceConnectionStatus.Signalling
-          ? 'Could not connect to the voice channel (stuck while handshaking). This usually means the hosting ' +
-            'provider blocks Discord voice traffic — a normal host (not game hosting) is required for a music bot.'
+          ? 'Could not connect to the voice channel (stuck while handshaking). This usually means UDP traffic is blocked by Windows Firewall / Antivirus or the Discord voice region needs to be changed.'
           : 'Could not connect to the voice channel (timed out).',
       );
     }
@@ -468,6 +462,15 @@ export class Player {
     const code = err?.rawError?.code ?? err?.code;
     const msg = String(err?.rawError?.message ?? err?.message ?? '');
 
+    if (/IP discovery|socket closed/i.test(msg)) {
+      return (
+        '❌ **Voice connection failed (UDP / IP Discovery error).**\n\n' +
+        '**Quick fixes:**\n' +
+        '1. **Change Voice Channel Region**: Edit the Voice Channel in Discord $\\rightarrow$ Overview $\\rightarrow$ Region Override $\\rightarrow$ change from *Automatic* to **India**, **Singapore**, or **Rotterdam**.\n' +
+        '2. **Windows Firewall / Antivirus**: Allow Node.js (`node.exe`) through Windows Defender Firewall (both Private and Public networks) or temporarily disable VPN / WARP.\n' +
+        '3. **Reset Bot Token**: If another instance of the bot is running elsewhere, reset the bot token in Discord Developer Portal.'
+      );
+    }
     if (code === 4004 || code === 4014 || /permission|no permission/i.test(msg)) {
       return (
         `I can't join <#${voiceChannel.id}> — I'm missing the **Connect** permission there. ` +

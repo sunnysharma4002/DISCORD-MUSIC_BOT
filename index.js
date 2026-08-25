@@ -1,6 +1,7 @@
-// Root entry point for Pterodactyl / hosting panels.
-// Guards against Node < 20 (the dependency stack requires it) BEFORE loading
-// any heavy modules, then delegates to the real bot in src/index.js.
+import dns from 'node:dns';
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
 
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 

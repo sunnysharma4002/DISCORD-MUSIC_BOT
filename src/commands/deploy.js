@@ -8,7 +8,15 @@ export default {
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } catch (err) {
+      if (err?.code === 10062 || err?.code === 40060) {
+        console.warn(`[deploy] Interaction already handled or expired: ${err.code}`);
+        return;
+      }
+      throw err;
+    }
 
     const clientId = process.env.CLIENT_ID;
     if (!clientId) {
