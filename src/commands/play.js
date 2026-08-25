@@ -116,12 +116,34 @@ export default {
 
     player.enqueue(tracks);
 
-    // Show loading state - player will send full embed after enrichment
+    // Send embed with thumbnail and buttons immediately
     if (startedEmpty) {
-      await interaction.editReply({
-        content: `⏳ Loading **${tracks[0].title?.slice(0, 100) || 'track'}**...`,
-        components: [],
+      const t = tracks[0];
+      const embed = new EmbedBuilder().setColor(0x57f287);
+      embed
+        .setAuthor({ name: '🎵 Now Playing' })
+        .setTitle(`🎶 ${t.title?.slice(0, 250) || 'Unknown track'}`)
+        .setURL(t.url)
+        .addFields(
+          { name: '🎤 Artist', value: t.author || 'Unknown', inline: true },
+          { name: '⏱ Duration', value: t.isLive ? '🔴 Live' : fmt(t.duration), inline: true },
+          { name: '📍 Position', value: 'Playing now', inline: true },
+          { name: '📡 Source', value: isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube', inline: true },
+          { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
+        );
+      if (t.thumbnail && t.thumbnail.startsWith('http')) {
+        embed.setThumbnail(t.thumbnail);
+      } else if (t.videoId) {
+        embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/maxresdefault.jpg`);
+      }
+
+      const reply = await interaction.editReply({
+        content: '## 🎵 **Now Playing**',
+        embeds: [embed],
+        components: [player.controlRow(), player.controlRow2()],
       });
+      player.controlPanelMessageId = reply.id;
+      console.log(`[play] control panel created with buttons, message id=${reply.id}`);
     } else {
       // Added to queue - show queue style embed
       const sourceLabel = isSpotifyURL(query) ? 'Spotify → YouTube' : 'YouTube';
@@ -143,7 +165,7 @@ export default {
         if (t.thumbnail && t.thumbnail.startsWith('http')) {
           embed.setThumbnail(t.thumbnail);
         } else if (t.videoId) {
-          embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg`);
+          embed.setThumbnail(`https://i.ytimg.com/vi/${t.videoId}/maxresdefault.jpg`);
         }
       } else {
         const totalMs = tracks.reduce((sum, t) => sum + (t.isLive ? 0 : t.duration), 0);
@@ -158,7 +180,7 @@ export default {
         if (tracks[0].thumbnail && tracks[0].thumbnail.startsWith('http')) {
           embed.setThumbnail(tracks[0].thumbnail);
         } else if (tracks[0].videoId) {
-          embed.setThumbnail(`https://i.ytimg.com/vi/${tracks[0].videoId}/hqdefault.jpg`);
+          embed.setThumbnail(`https://i.ytimg.com/vi/${tracks[0].videoId}/maxresdefault.jpg`);
         }
       }
 
