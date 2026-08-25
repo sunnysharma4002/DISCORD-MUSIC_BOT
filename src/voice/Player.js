@@ -796,13 +796,13 @@ export class Player {
 
     // YouTube tracks: try Vercel relay first (bypasses IP blocks)
     if (track.source === 'youtube' && isRelayEnabled() && videoId) {
-      console.log(`[player] trying Vercel relay for YouTube audio: ${videoId}`);
+      console.log(`[player] trying Cloudflare relay for YouTube audio: ${videoId}`);
       const relayUrl = await relayAudioStream(videoId);
       if (relayUrl) {
-        console.log(`[player] Vercel relay stream URL obtained, streaming directly`);
+        console.log(`[player] Cloudflare relay stream URL obtained, streaming directly`);
         return this._streamDirect(relayUrl, track);
       }
-      console.log(`[player] Vercel relay failed, falling back to yt-dlp`);
+      console.log(`[player] Cloudflare relay failed, falling back to yt-dlp`);
     }
 
     // Always enrich metadata to get the best data from yt-dlp

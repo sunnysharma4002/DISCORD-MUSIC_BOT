@@ -170,21 +170,42 @@ export async function relayVideoInfo(videoId) {
 
 /**
  * Get a proxied audio stream URL from the relay.
- * Cloudflare: uses Invidious instances
- * Vercel: uses youtubei.js endpoint
+ * Cloudflare: uses youtubei.js to get YouTube stream URL
+ * Vercel: uses direct endpoint
  */
 export async function relayAudioStream(videoId) {
   if (!ENABLED) return null;
 
   try {
     if (IS_CLOUDFLARE) {
-      return await getStreamViaInvidious(videoId);
-    } else {
-      const url = new URL(`${RELAY_URL}/api/stream`);
-      url.searchParams.set('id', videoId);
-      url.searchParams.set('format', 'audio');
+      // Cloudflare relay: use youtubei.js to get YouTube stream URL
+      const url = `${RELAY_URL}/api/stream?id=${videoId}`;
+      const res = await fetch(url, {
+        headers: buildRelayHeaders(),
+        signal: AbortSignal.timeout(15_000),
+      });
 
-      const res = await fetch(url.toString(), {
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'unknown');
+        console.warn(`[relay] stream HTTP ${res.status}: ${text.substring(0, 300)}`);
+        return null;
+      }
+
+      const data = await res.json();
+      if (!data.streamUrl) {
+        console.warn(`[relay] no streamUrl in response: ${JSON.stringify(data).substring(0, 200)}`);
+        return null;
+      }
+
+      console.log(`[relay] got YouTube stream URL via Cloudflare: ${data.mimeType || 'audio'} ${data.bitrate ? `${Math.round(data.bitrate/1000)}kbps` : ''}`);
+      return data.streamUrl;
+    } else {
+      // Vercel relay: direct endpoint
+      const vurl = new URL(`${RELAY_URL}/api/stream`);
+      vurl.searchParams.set('id', videoId);
+      vurl.searchParams.set('format', 'audio');
+
+      const res = await fetch(vurl.toString(), {
         headers: buildRelayHeaders(),
         signal: AbortSignal.timeout(15_000),
       });
@@ -208,57 +229,6 @@ export async function relayAudioStream(videoId) {
     console.warn(`[relay] stream URL fetch failed: ${err.message}`);
     return null;
   }
-}
-
-/**
- * Get audio stream URL via Invidious instances (for Cloudflare relay).
- */
-async function getStreamViaInvidious(videoId) {
-  const instances = [
-    'https://invidious.fdn.fr',
-    'https://yewtu.be',
-    'https://inv.tux.pizza',
-    'https://vid.puffyan.us',
-    'https://invidious.privacydev.net',
-    'https://iv.ggtyler.dev',
-  ];
-
-  for (const instance of instances) {
-    try {
-      const url = `${instance}/api/v1/videos/${videoId}`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-      });
-
-      clearTimeout(timeout);
-
-      if (!res.ok) continue;
-
-      const data = await res.json();
-
-      if (data.error) continue;
-
-      const audioFormats = (data.adaptiveFormats || data.formatStreams || [])
-        .filter(f => f.type?.includes('audio') && f.url);
-
-      if (audioFormats.length > 0) {
-        audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        const best = audioFormats[0];
-
-        console.log(`[relay] got Invidious stream via ${instance}`);
-        return best.url;
-      }
-    } catch (err) {
-      continue;
-    }
-  }
-
-  console.warn('[relay] all Invidious instances failed');
-  return null;
 }
 
 /** Parse YouTube search results from HTML. */
