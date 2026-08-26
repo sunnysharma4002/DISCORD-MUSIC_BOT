@@ -1,4 +1,5 @@
 import { Innertube, Log, Platform, UniversalCache } from 'youtubei.js';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -184,6 +185,56 @@ export async function getStreamUrl(videoId) {
 
   if (lastError) {
     console.warn(`[youtube] getStreamUrl failed for ${videoId}: ${lastError.message}`);
+  }
+  return null;
+}
+
+/**
+ * Create an audio stream for a video.
+ * Returns { stream: Readable, isOpus: boolean, client: string } or null.
+ * Uses demuxProbe-compatible approach: Opus streams can be played directly without ffmpeg.
+ */
+export async function createStream(videoId) {
+  const yt = await getYouTube();
+  let lastError = null;
+
+  for (const client of NO_POTOKEN_CLIENTS) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+
+      const status = info.playability_status?.status;
+      if (status && status !== 'OK') {
+        console.debug(`[youtube] ${client} not playable: ${status}`);
+        continue;
+      }
+
+      const formats = (info.streaming_data?.adaptive_formats ?? [])
+        .filter((f) => f.has_audio && !f.has_video && f.url && !f.drm_families?.length);
+
+      if (formats.length === 0) {
+        console.debug(`[youtube] ${client} no audio formats for ${videoId}`);
+        continue;
+      }
+
+      // Prefer Opus (no transcoding needed), then highest bitrate
+      const opus = formats.filter((f) => /webm/i.test(f.mime_type) && /opus/i.test(f.mime_type));
+      const pool = opus.length ? opus : formats;
+      const best = pool.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
+      console.log(`[youtube] stream via ${client}: ${best.mime_type} ${best.bitrate ? `${Math.round(best.bitrate / 1000)}kbps` : ''}`);
+
+      const webStream = await info.download({ itag: best.itag, type: 'audio' });
+      const stream = Readable.fromWeb(webStream);
+
+      return { stream, isOpus: opus.includes(best), client };
+    } catch (err) {
+      lastError = err;
+      console.debug(`[youtube] ${client} createStream failed for ${videoId}: ${err.message}`);
+    }
+  }
+
+  if (lastError) {
+    console.warn(`[youtube] createStream failed for ${videoId}: ${lastError.message}`);
   }
   return null;
 }
