@@ -817,10 +817,26 @@ export class Player {
     // YouTube tracks: try youtubei.js directly (no relay needed)
     if (track.source === 'youtube' && videoId) {
       console.log(`[player] trying youtubei.js for YouTube audio: ${videoId}`);
-      const directUrl = await getStreamUrl(videoId);
-      if (directUrl) {
-        console.log(`[player] youtubei.js stream URL obtained, streaming via ffmpeg`);
-        return this._streamViaFfmpeg(directUrl, track);
+      const streamData = await createStream(videoId);
+      if (streamData) {
+        console.log(`[player] youtubei.js stream obtained: isOpus=${streamData.isOpus} client=${streamData.client}`);
+
+        if (streamData.isOpus) {
+          // Opus stream — Discord plays natively, no ffmpeg needed
+          const probe = await demuxProbe(streamData.stream);
+          const resource = createAudioResource(probe.stream, {
+            inputType: probe.type,
+            inlineVolume: true,
+            metadata: track,
+          });
+          resource.on('error', () => streamData.stream.destroy());
+          console.log(`[player] Opus resource created for "${track.title}"`);
+          return resource;
+        } else {
+          // Non-Opus — transcode via ffmpeg
+          console.log(`[player] non-Opus stream, transcoding via ffmpeg`);
+          return this._streamViaFfmpegReadable(streamData.stream, track);
+        }
       }
       console.log(`[player] youtubei.js failed, falling back to yt-dlp`);
     }
@@ -936,28 +952,15 @@ export class Player {
 
   /** Stream audio from a URL via ffmpeg (for YouTube innerTube direct URLs). */
   async _streamViaFfmpeg(audioUrl, track) {
+    // Deprecated: use _streamViaFfmpegReadable instead
+    throw new Error('Use _streamViaFfmpegReadable for Readable streams');
+  }
+
+  /** Transcode a Readable stream to raw PCM via ffmpeg (for non-Opus YouTube streams). */
+  async _streamViaFfmpegReadable(readable, track) {
     if (!ffmpegPath) throw new Error('ffmpeg binary not found (ffmpeg-static failed to install).');
 
-    console.log(`[player] ffmpeg streaming: ${audioUrl.substring(0, 80)}...`);
-
-    // Fetch the stream with proper headers via Node.js, then pipe to ffmpeg
-    const response = await fetch(audioUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com',
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Stream fetch failed: HTTP ${response.status} ${response.statusText}`);
-    }
-
-    if (!response.body) {
-      throw new Error('Stream fetch returned no body');
-    }
-
-    console.log(`[player] stream fetched: status=${response.status} type=${response.headers.get('content-type')} size=${response.headers.get('content-length')}`);
+    console.log(`[player] ffmpeg transcoding via stdin...`);
 
     const args = [
       '-hide_banner', '-loglevel', 'error',
@@ -982,28 +985,20 @@ export class Player {
       }
     });
 
-    // Pipe Node.js fetch response body into ffmpeg stdin
-    const reader = response.body.getReader();
-    const pump = async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { child.stdin.end(); break; }
-          if (!child.stdin.destroyed) child.stdin.write(value);
-        }
-      } catch (err) {
-        if (!child.stdin.destroyed) child.stdin.destroy();
-      }
-    };
-    pump();
+    // Pipe the Readable stream into ffmpeg stdin
+    readable.pipe(child.stdin);
+    readable.on('error', (err) => {
+      console.error(`[player] input stream error: ${err.message}`);
+      child.stdin.destroy();
+    });
 
     const resource = createAudioResource(child.stdout, {
       inputType: StreamType.Raw,
-      inlineVolume: false,
+      inlineVolume: true,
       metadata: track,
     });
 
-    console.log(`[player] ffmpeg stream resource created for "${track.title}"`);
+    console.log(`[player] ffmpeg transcoded resource created for "${track.title}"`);
     return resource;
   }
 
