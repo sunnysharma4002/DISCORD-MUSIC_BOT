@@ -15,7 +15,12 @@ import { existsSync, writeFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import ffmpegPath from 'ffmpeg-static';
+import ffmpegStatic from 'ffmpeg-static';
+
+// Prefer system ffmpeg (nixpacks/Railway) over ffmpeg-static bundled binary.
+// ffmpeg-static bundles a platform-specific binary that may not run on Linux.
+// Railway installs ffmpeg via nixpkgs, so system ffmpeg is available on PATH.
+const ffmpegPath = process.platform !== 'win32' ? 'ffmpeg' : ffmpegStatic;
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
