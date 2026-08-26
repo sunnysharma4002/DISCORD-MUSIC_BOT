@@ -924,17 +924,34 @@ export class Player {
 
     console.log(`[player] ffmpeg streaming: ${audioUrl.substring(0, 80)}...`);
 
+    // Fetch the stream with proper headers via Node.js, then pipe to ffmpeg
+    const response = await fetch(audioUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Stream fetch failed: HTTP ${response.status} ${response.statusText}`);
+    }
+
+    if (!response.body) {
+      throw new Error('Stream fetch returned no body');
+    }
+
+    console.log(`[player] stream fetched: status=${response.status} type=${response.headers.get('content-type')} size=${response.headers.get('content-length')}`);
+
     const args = [
       '-hide_banner', '-loglevel', 'error',
-      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-      '-headers', 'Referer: https://www.youtube.com/\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\r\n',
-      '-i', audioUrl,
+      '-i', 'pipe:0',
       '-vn', '-sn', '-dn',
       '-ar', '48000', '-ac', '2',
       '-f', 's16le', 'pipe:1',
     ];
 
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let stderr = '';
 
     child.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -948,6 +965,21 @@ export class Player {
         console.warn(`[player] ffmpeg exited ${code}: ${stderr.trim().substring(0, 200)}`);
       }
     });
+
+    // Pipe Node.js fetch response body into ffmpeg stdin
+    const reader = response.body.getReader();
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) { child.stdin.end(); break; }
+          if (!child.stdin.destroyed) child.stdin.write(value);
+        }
+      } catch (err) {
+        if (!child.stdin.destroyed) child.stdin.destroy();
+      }
+    };
+    pump();
 
     const resource = createAudioResource(child.stdout, {
       inputType: StreamType.Raw,
