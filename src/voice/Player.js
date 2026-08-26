@@ -35,7 +35,7 @@ const ffmpegPath = (() => {
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import { getStreamUrl } from '../utils/youtube.js';
+import { getStreamUrl, createStream } from '../utils/youtube.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
