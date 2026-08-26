@@ -59,24 +59,35 @@ export async function registerCommands(client, clientId, guildId, { purgeGlobals
   }
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  const route = guildId
-    ? Routes.applicationGuildCommands(clientId, guildId)
-    : Routes.applicationCommands(clientId);
 
-  if (guildId && purgeGlobals) {
-    // Only delete stale global commands during an EXPLICIT deploy.
-    // (A legacy global `/play` with option `song` was shadowing ours.)
-    await clearGlobalCommands(clientId);
+  // If GUILD_ID is set, try guild-scoped registration first
+  if (guildId) {
+    if (purgeGlobals) {
+      await clearGlobalCommands(clientId);
+    }
+
+    try {
+      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: payload });
+      console.log(`[INFO] Registered ${payload.length} command(s) in guild ${guildId}.`);
+      await verifyCommands(rest, clientId, Routes.applicationGuildCommands(clientId, guildId));
+      return;
+    } catch (err) {
+      // Guild registration failed (bot not in guild, wrong permissions, etc.)
+      // Fall back to global registration instead of crashing
+      console.warn(`[WARN] Could not register in guild ${guildId}: ${err?.message ?? err}`);
+      console.warn('[WARN] Falling back to GLOBAL command registration (all servers).');
+    }
   }
 
+  // Global registration (all servers)
+  const route = Routes.applicationCommands(clientId);
   await rest.put(route, { body: payload });
+  console.log(`[INFO] Registered ${payload.length} command(s) globally (may take up to 1 hour to appear).`);
+  await verifyCommands(rest, clientId, route);
+}
 
-  console.log(
-    `[INFO] Registered ${payload.length} command(s) ` +
-    (guildId ? `in guild ${guildId}.` : 'globally (may take up to 1 hour to appear).'),
-  );
-
-  // Fetch back what Discord actually has — verifies required options are live.
+/** Fetch back registered commands and log them for verification. */
+async function verifyCommands(rest, clientId, route) {
   try {
     const registered = await rest.get(route);
     console.log('[VERIFY] Commands now live on Discord:');

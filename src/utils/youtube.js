@@ -11,11 +11,9 @@ let ytReady = false;
 
 /**
  * Clients that work WITHOUT po_token (no botguard challenge needed).
- * Order: most reliable first. IOS and ANDROID rarely get blocked.
- * TV_EMBEDDED is great for streams. MWEB is a mobile web fallback.
- * WEB is excluded — it requires po_token which we auto-generate instead.
+ * Order matches Redux-Music-Bot which works: VISIONOS is key — it's rarely blocked.
  */
-const NO_POTOKEN_CLIENTS = ['IOS', 'ANDROID', 'TV_EMBEDDED', 'MWEB'];
+const NO_POTOKEN_CLIENTS = ['VISIONOS', 'IOS', 'MWEB', 'ANDROID_VR'];
 
 /**
  * Initialize the YouTube InnerTube client.
@@ -43,7 +41,6 @@ async function getYouTube() {
   ytInstance = await Innertube.create({
     cache: new UniversalCache(true, cacheDir),
     cookie,
-    generate_session_locally: true,
   });
 
   ytReady = true;
@@ -54,41 +51,33 @@ async function getYouTube() {
 /** Search YouTube and return up to `limit` video results. */
 export async function search(query, limit = 5) {
   const yt = await getYouTube();
-  let lastError = null;
 
-  for (const client of NO_POTOKEN_CLIENTS) {
-    try {
-      const results = await yt.search(query, { type: 'video', client });
-      const items = results.videos || results.results || [];
-      const videos = [];
+  try {
+    const results = await yt.search(query, { type: 'video' });
+    const items = results.videos || results.results || [];
+    const videos = [];
 
-      for (const item of items) {
-        const id = item.id || item.video_id;
-        if (!id) continue;
-        videos.push({
-          id,
-          title: item.title?.text || item.title || 'Unknown',
-          url: `https://www.youtube.com/watch?v=${id}`,
-          duration: item.duration?.seconds || 0,
-          thumbnail: item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-          author: item.author?.name || item.author?.text || 'Unknown',
-          isLive: Boolean(item.is_live),
-        });
-        if (videos.length >= limit) break;
-      }
-
-      if (videos.length > 0) {
-        console.log(`[youtube] search OK via ${client}: ${videos.length} results for "${query.substring(0, 40)}"`);
-        return videos;
-      }
-    } catch (err) {
-      lastError = err;
-      console.debug(`[youtube] search via ${client} failed: ${err.message}`);
+    for (const item of items) {
+      const id = item.id || item.video_id;
+      if (!id) continue;
+      videos.push({
+        id,
+        title: item.title?.text || item.title || 'Unknown',
+        url: `https://www.youtube.com/watch?v=${id}`,
+        duration: item.duration?.seconds || 0,
+        thumbnail: item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+        author: item.author?.name || item.author?.text || 'Unknown',
+        isLive: Boolean(item.is_live),
+      });
+      if (videos.length >= limit) break;
     }
-  }
 
-  if (lastError) {
-    console.warn(`[youtube] search failed for "${query.substring(0, 40)}": ${lastError.message}`);
+    if (videos.length > 0) {
+      console.log(`[youtube] search OK: ${videos.length} results for "${query.substring(0, 40)}"`);
+      return videos;
+    }
+  } catch (err) {
+    console.warn(`[youtube] search failed for "${query.substring(0, 40)}": ${err.message}`);
   }
   return [];
 }

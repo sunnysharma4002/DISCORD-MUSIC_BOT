@@ -15,6 +15,7 @@ import { existsSync, writeFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import ffmpegPath from 'ffmpeg-static';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
@@ -802,8 +803,8 @@ export class Player {
       console.log(`[player] trying youtubei.js for YouTube audio: ${videoId}`);
       const directUrl = await getStreamUrl(videoId);
       if (directUrl) {
-        console.log(`[player] youtubei.js stream URL obtained, streaming directly`);
-        return this._streamDirect(directUrl, track);
+        console.log(`[player] youtubei.js stream URL obtained, streaming via ffmpeg`);
+        return this._streamViaFfmpeg(directUrl, track);
       }
       console.log(`[player] youtubei.js failed, falling back to yt-dlp`);
     }
@@ -915,6 +916,47 @@ export class Player {
       }
       throw err;
     }
+  }
+
+  /** Stream audio from a URL via ffmpeg (for YouTube innerTube direct URLs). */
+  async _streamViaFfmpeg(audioUrl, track) {
+    if (!ffmpegPath) throw new Error('ffmpeg binary not found (ffmpeg-static failed to install).');
+
+    console.log(`[player] ffmpeg streaming: ${audioUrl.substring(0, 80)}...`);
+
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+      '-i', audioUrl,
+      '-vn', '-sn', '-dn',
+      '-ar', '48000', '-ac', '2',
+      '-f', 's16le', 'pipe:1',
+    ];
+
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stderr = '';
+    let resourceCreated = false;
+
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const resource = createAudioResource(child.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: false,
+      metadata: track,
+    });
+
+    child.on('error', (err) => {
+      console.error(`[player] ffmpeg spawn error: ${err.message}`);
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0 && code !== null) {
+        console.warn(`[player] ffmpeg exited ${code}: ${stderr.trim().substring(0, 200)}`);
+      }
+    });
+
+    console.log(`[player] ffmpeg stream resource created for "${track.title}"`);
+    return resource;
   }
 
   /** Stream audio using yt-dlp with multiple player client strategies. */
