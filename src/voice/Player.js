@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import { relayAudioStream, isRelayEnabled } from '../utils/relay.js';
+import { getStreamUrl } from '../utils/youtube.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -783,7 +783,7 @@ export class Player {
    * Uses Node.js JS runtime for signature decryption (--js-runtimes node).
    * Tries multiple player clients (android, ios, tv_embedded, web).
    * For JioSaavn tracks, streams directly from the provided audio URL.
-   * For YouTube tracks, tries Vercel relay first (bypasses IP blocks).
+   * For YouTube tracks, tries youtubei.js directly first.
    */
   async _createResource(track) {
     const url = track.url ?? `https://www.youtube.com/watch?v=${track.videoId}`;
@@ -797,15 +797,15 @@ export class Player {
       return this._streamDirect(track.audioUrl, track);
     }
 
-    // YouTube tracks: try Vercel relay first (bypasses IP blocks)
-    if (track.source === 'youtube' && isRelayEnabled() && videoId) {
-      console.log(`[player] trying Cloudflare relay for YouTube audio: ${videoId}`);
-      const relayUrl = await relayAudioStream(videoId);
-      if (relayUrl) {
-        console.log(`[player] Cloudflare relay stream URL obtained, streaming directly`);
-        return this._streamDirect(relayUrl, track);
+    // YouTube tracks: try youtubei.js directly (no relay needed)
+    if (track.source === 'youtube' && videoId) {
+      console.log(`[player] trying youtubei.js for YouTube audio: ${videoId}`);
+      const directUrl = await getStreamUrl(videoId);
+      if (directUrl) {
+        console.log(`[player] youtubei.js stream URL obtained, streaming directly`);
+        return this._streamDirect(directUrl, track);
       }
-      console.log(`[player] Cloudflare relay failed, falling back to yt-dlp`);
+      console.log(`[player] youtubei.js failed, falling back to yt-dlp`);
     }
 
     // Always enrich metadata to get the best data from yt-dlp

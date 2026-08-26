@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
-import { relaySearch, isRelayEnabled } from '../utils/relay.js';
+import { search as ytSearch } from '../utils/youtube.js';
 
 const _projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const _vendoredYtdlp = join(_projectRoot, 'vendor', 'yt-dlp');
@@ -676,27 +676,25 @@ function readSoundCloudItem(item) {
 /** Runs a YouTube search and returns the first usable video, or null. */
 async function searchYouTube(query) {
   const apiKey = process.env.YOUTUBE_API_KEY?.trim();
-  console.log(`[resolver] searchYouTube: query="${query.substring(0, 50)}" apiKey=${apiKey ? 'set' : 'missing'} relay=${isRelayEnabled() ? 'enabled' : 'disabled'}`);
+  console.log(`[resolver] searchYouTube: query="${query.substring(0, 50)}" apiKey=${apiKey ? 'set' : 'missing'}`);
 
-  // Strategy 1: Vercel Relay (bypasses IP blocks)
-  if (isRelayEnabled()) {
-    const relayResults = await relaySearch(query, 5);
-    if (relayResults && relayResults.length > 0) {
-      const video = relayResults[0];
-      console.log(`[resolver] relay search found: "${video.title?.substring(0, 50)}"`);
-      return {
-        title: video.title || 'Unknown title',
-        url: video.url || `https://www.youtube.com/watch?v=${video.id}`,
-        videoId: video.id,
-        duration: (Number(video.duration) || 0) * 1000,
-        isLive: Boolean(video.isLive),
-        thumbnail: video.thumbnail || `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
-        author: video.author || 'Unknown',
-        source: 'youtube',
-      };
-    }
-    console.log('[resolver] relay search returned no results');
+  // Strategy 1: youtubei.js (direct, no relay)
+  const ytResults = await ytSearch(query, 5);
+  if (ytResults && ytResults.length > 0) {
+    const video = ytResults[0];
+    console.log(`[resolver] youtubei.js search found: "${video.title?.substring(0, 50)}"`);
+    return {
+      title: video.title || 'Unknown title',
+      url: video.url || `https://www.youtube.com/watch?v=${video.id}`,
+      videoId: video.id,
+      duration: (Number(video.duration) || 0) * 1000,
+      isLive: Boolean(video.isLive),
+      thumbnail: video.thumbnail || `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
+      author: video.author || 'Unknown',
+      source: 'youtube',
+    };
   }
+  console.log('[resolver] youtubei.js search returned no results');
 
   // Strategy 2: YouTube Data API v3
   if (apiKey) {
