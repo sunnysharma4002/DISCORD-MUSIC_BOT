@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { Innertube, Log, Platform, UniversalCache } from 'youtubei.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -11,8 +10,17 @@ let ytInstance = null;
 let ytReady = false;
 
 /**
+ * Clients that work WITHOUT po_token (no botguard challenge needed).
+ * Order: most reliable first. IOS and ANDROID rarely get blocked.
+ * TV_EMBEDDED is great for streams. MWEB is a mobile web fallback.
+ * WEB is excluded — it requires po_token which we auto-generate instead.
+ */
+const NO_POTOKEN_CLIENTS = ['IOS', 'ANDROID', 'TV_EMBEDDED', 'MWEB'];
+
+/**
  * Initialize the YouTube InnerTube client.
- * Called lazily on first use.
+ * Automatically generates visitor data and session — no manual config needed.
+ * If YOUTUBE_COOKIE is set, it's used for age-restricted videos.
  */
 async function getYouTube() {
   if (ytInstance && ytReady) return ytInstance;
@@ -28,28 +36,27 @@ async function getYouTube() {
   };
 
   const cookie = process.env.YOUTUBE_COOKIE?.trim() || undefined;
-  const poToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
-  const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || undefined;
 
+  // youtubei.js auto-generates visitor data and session on create().
+  // No need for manual YOUTUBE_PO_TOKEN or YOUTUBE_VISITOR_DATA.
+  // The library handles all the botguard challenges internally.
   ytInstance = await Innertube.create({
     cache: new UniversalCache(true, cacheDir),
     cookie,
-    po_token: poToken,
-    visitor_data: visitorData,
+    generate_session_locally: true,
   });
 
   ytReady = true;
-  console.log('[youtube] InnerTube client ready');
+  console.log('[youtube] InnerTube client ready (auto-generated session, no manual po_token needed)');
   return ytInstance;
 }
 
 /** Search YouTube and return up to `limit` video results. */
 export async function search(query, limit = 5) {
   const yt = await getYouTube();
-  const clients = ['IOS', 'WEB', 'MWEB', 'ANDROID_VR'];
   let lastError = null;
 
-  for (const client of clients) {
+  for (const client of NO_POTOKEN_CLIENTS) {
     try {
       const results = await yt.search(query, { type: 'video', client });
       const items = results.videos || results.results || [];
@@ -92,10 +99,9 @@ export async function search(query, limit = 5) {
  */
 export async function getVideoInfo(videoId) {
   const yt = await getYouTube();
-  const clients = ['IOS', 'WEB', 'MWEB', 'ANDROID_VR'];
   let lastError = null;
 
-  for (const client of clients) {
+  for (const client of NO_POTOKEN_CLIENTS) {
     try {
       const info = await yt.getBasicInfo(videoId, { client });
       const basic = info.basic_info ?? {};
@@ -120,15 +126,14 @@ export async function getVideoInfo(videoId) {
 
 /**
  * Get a direct audio stream URL for a video.
- * Tries multiple InnerTube clients and returns the best audio format URL.
+ * Tries multiple InnerTube clients (no po_token needed) and returns the best audio format URL.
  * Returns null if no stream URL can be obtained.
  */
 export async function getStreamUrl(videoId) {
   const yt = await getYouTube();
-  const clients = ['IOS', 'WEB', 'MWEB', 'ANDROID_VR'];
   let lastError = null;
 
-  for (const client of clients) {
+  for (const client of NO_POTOKEN_CLIENTS) {
     try {
       const info = await yt.getBasicInfo(videoId, { client });
 
