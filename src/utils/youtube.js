@@ -16,6 +16,35 @@ let ytReady = false;
 const NO_POTOKEN_CLIENTS = ['VISIONOS', 'IOS', 'MWEB', 'ANDROID_VR'];
 
 /**
+ * Parse Netscape cookie file format into a Cookie header string for youtubei.js.
+ * Also handles simple "name=value; name=value" format.
+ */
+function parseCookieString(raw) {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+
+  // Already in header format: "name=value; name=value"
+  if (trimmed.includes('=') && !trimmed.includes('\t')) {
+    return trimmed;
+  }
+
+  // Netscape format: extract name and value columns
+  const pairs = [];
+  for (const line of trimmed.split('\n')) {
+    if (line.startsWith('#') || !line.trim()) continue;
+    const parts = line.split('\t');
+    if (parts.length >= 7) {
+      const name = parts[5];
+      const value = parts[6];
+      if (name && value !== undefined) {
+        pairs.push(`${name}=${value.trim()}`);
+      }
+    }
+  }
+  return pairs.length > 0 ? pairs.join('; ') : undefined;
+}
+
+/**
  * Initialize the YouTube InnerTube client.
  * Automatically generates visitor data and session — no manual config needed.
  * If YOUTUBE_COOKIE is set, it's used for age-restricted videos.
@@ -33,7 +62,7 @@ async function getYouTube() {
     return fn(...names.map((name) => env[name]));
   };
 
-  const cookie = process.env.YOUTUBE_COOKIE?.trim() || undefined;
+  const cookie = parseCookieString(process.env.YOUTUBE_COOKIE);
 
   // youtubei.js auto-generates visitor data and session on create().
   // No need for manual YOUTUBE_PO_TOKEN or YOUTUBE_VISITOR_DATA.
