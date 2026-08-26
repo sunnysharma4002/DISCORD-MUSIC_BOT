@@ -4,7 +4,7 @@ import { registerCommands } from './handler.js';
 export default {
   data: new SlashCommandBuilder()
     .setName('deploy')
-    .setDescription('Re-register all slash commands in this server (server admins only)')
+    .setDescription('Re-register all slash commands globally (server admins only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
@@ -26,11 +26,12 @@ export default {
     }
 
     try {
-      await registerCommands(interaction.client, clientId, interaction.guild.id, { purgeGlobals: true });
+      // Register globally (all servers), not just this guild
+      await registerCommands(interaction.client, clientId, null, { purgeGlobals: true });
       return interaction.editReply(
-        '✅ Commands re-registered in this server (stale global commands removed).\n' +
-        'They should refresh within a few seconds — if you still see the old behavior, ' +
-        'restart your Discord client (**Ctrl/Cmd + R**) to clear the command cache.',
+        '✅ Commands re-registered **globally** in all servers.\n' +
+        'This can take up to **1 hour** to appear everywhere. ' +
+        'If you still see old commands, restart Discord (**Ctrl/Cmd + R**) to clear the cache.',
       );
     } catch (err) {
       console.error('[deploy]', err);
