@@ -927,6 +927,7 @@ export class Player {
     const args = [
       '-hide_banner', '-loglevel', 'error',
       '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+      '-headers', 'Referer: https://www.youtube.com/\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\r\n',
       '-i', audioUrl,
       '-vn', '-sn', '-dn',
       '-ar', '48000', '-ac', '2',
@@ -935,15 +936,8 @@ export class Player {
 
     const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stderr = '';
-    let resourceCreated = false;
 
     child.stderr.on('data', (d) => { stderr += d.toString(); });
-
-    const resource = createAudioResource(child.stdout, {
-      inputType: StreamType.Raw,
-      inlineVolume: false,
-      metadata: track,
-    });
 
     child.on('error', (err) => {
       console.error(`[player] ffmpeg spawn error: ${err.message}`);
@@ -953,6 +947,12 @@ export class Player {
       if (code !== 0 && code !== null) {
         console.warn(`[player] ffmpeg exited ${code}: ${stderr.trim().substring(0, 200)}`);
       }
+    });
+
+    const resource = createAudioResource(child.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: false,
+      metadata: track,
     });
 
     console.log(`[player] ffmpeg stream resource created for "${track.title}"`);
