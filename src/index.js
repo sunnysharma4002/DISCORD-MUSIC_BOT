@@ -93,13 +93,11 @@ async function onReady() {
 
   console.log(`[READY] ${client.user.tag} online in ${client.guilds.cache.size} guild(s).`);
 
-  if (!GUILD_ID) {
-    console.error('[WARNING] GUILD_ID is not set in .env!');
-    console.error('          Commands will register GLOBALLY and can take up to 1 HOUR');
-    console.error('          to appear — stale commands will keep failing in the meantime.');
-    console.error('          Set GUILD_ID to your server ID and restart, or use /deploy in a');
-    console.error('          server once this bot has any commands.');
-  }
+  // Command registration scope
+  const scope = GUILD_ID
+    ? `guild ${GUILD_ID} (instant)`
+    : 'ALL servers (global, up to 1 hour to appear)';
+  console.log(`[INFO] Commands registered in ${scope}.`);
 
   client.user.setPresence({
     activities: [{ name: '/play', type: ActivityType.Listening }],
