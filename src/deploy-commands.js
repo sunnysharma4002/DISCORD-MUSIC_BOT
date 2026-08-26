@@ -13,18 +13,18 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   process.exit(1);
 }
 
-if (!GUILD_ID) {
-  console.warn('[WARN] GUILD_ID is not set — commands will be registered GLOBALLY.');
-  console.warn('[WARN] Global commands can take up to 1 HOUR to appear.');
-  console.warn('[WARN] Set GUILD_ID in .env for instant registration in one server.\n');
-}
+const scope = GUILD_ID
+  ? `guild ${GUILD_ID} (instant)`
+  : 'ALL servers globally (up to 1 hour to appear)';
+
+console.log(`\n🔧 Registering commands in ${scope}...\n`);
 
 // registerCommands only needs a `commands` collection to populate
 const stub = { commands: new Collection() };
 
 try {
   await registerCommands(stub, CLIENT_ID, GUILD_ID, { purgeGlobals: true });
-  console.log('✅ Deploy complete.');
+  console.log('\n✅ Deploy complete.');
   process.exit(0);
 } catch (err) {
   console.error('❌ Deploy failed:', err);
