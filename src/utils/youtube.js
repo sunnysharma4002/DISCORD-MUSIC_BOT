@@ -2,6 +2,7 @@ import { Innertube, Log, Platform, UniversalCache } from 'youtubei.js';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { getCookieHeader } from './cookies.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(dirname(__dirname));
@@ -14,12 +15,20 @@ let ytReady = false;
 
 /**
  * InnerTube clients to try, in order, when resolving an audio stream.
- * Configurable via YOUTUBE_CLIENTS (comma-separated). Matches Redux-Music-Bot defaults.
- * Valid: VISIONOS, IOS, MWEB, ANDROID_VR, WEB, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
+ * Configurable via YOUTUBE_CLIENTS (comma-separated).
+ *
+ * Order matters. With an authenticated cookie jar, the mobile/embedded clients
+ * (VISIONOS, IOS, ANDROID_VR) reject the request — YouTube answers HTTP 400
+ * "Request contains an invalid argument" because those clients aren't expected to carry
+ * web session cookies. MWEB and WEB accept the cookies and return age-restricted audio,
+ * so they lead. Verified against a real jar: MWEB/WEB/WEB_CREATOR return OK with audio
+ * formats for both normal and age-restricted videos.
+ *
+ * Valid: VISIONOS, IOS, MWEB, ANDROID_VR, WEB, WEB_CREATOR, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
  */
 const STREAM_CLIENTS = (process.env.YOUTUBE_CLIENTS?.trim()
   ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
-  : ['VISIONOS', 'IOS', 'MWEB', 'ANDROID_VR', 'TV_EMBEDDED', 'WEB_EMBEDDED']);
+  : ['MWEB', 'WEB', 'WEB_CREATOR', 'VISIONOS', 'IOS', 'ANDROID_VR']);
 
 /** Kept for the metadata helpers below. */
 const NO_POTOKEN_CLIENTS = STREAM_CLIENTS;
@@ -58,38 +67,8 @@ function isPermanentFailure(status, reason = '') {
 }
 
 /**
- * Parse Netscape cookie file format into a Cookie header string for youtubei.js.
- * Also handles simple "name=value; name=value" format.
- */
-function parseCookieString(raw) {
-  if (!raw) return undefined;
-  const trimmed = raw.trim();
-
-  // Already in header format: "name=value; name=value"
-  if (trimmed.includes('=') && !trimmed.includes('\t')) {
-    return trimmed;
-  }
-
-  // Netscape format: extract name and value columns
-  const pairs = [];
-  for (const line of trimmed.split('\n')) {
-    if (line.startsWith('#') || !line.trim()) continue;
-    const parts = line.split('\t');
-    if (parts.length >= 7) {
-      const name = parts[5];
-      const value = parts[6];
-      if (name && value !== undefined) {
-        pairs.push(`${name}=${value.trim()}`);
-      }
-    }
-  }
-  return pairs.length > 0 ? pairs.join('; ') : undefined;
-}
-
-/**
  * Initialize the YouTube InnerTube client.
- * Automatically generates visitor data and session — no manual config needed.
- * If YOUTUBE_COOKIE is set, it's used for age-restricted videos.
+ * Cookies are read from the yt-cookies.txt jar (see src/utils/cookies.js), not from env.
  */
 async function getYouTube() {
   if (ytInstance && ytReady) return ytInstance;
@@ -104,7 +83,7 @@ async function getYouTube() {
     return fn(...names.map((name) => env[name]));
   };
 
-  const cookie = parseCookieString(process.env.YOUTUBE_COOKIE);
+  const cookie = getCookieHeader();
   // Only use manual tokens if explicitly set and non-empty.
   // Otherwise let youtubei.js auto-generate visitor_data and po_token.
   const poToken = (process.env.YOUTUBE_PO_TOKEN?.trim()?.length > 0) ? process.env.YOUTUBE_PO_TOKEN.trim() : undefined;
@@ -118,7 +97,7 @@ async function getYouTube() {
   });
 
   ytReady = true;
-  console.log(`[youtube] InnerTube client ready (clients: ${STREAM_CLIENTS.join(' > ')})`);
+  console.log(`[youtube] InnerTube client ready (cookies=${cookie ? 'yes' : 'no'}, clients: ${STREAM_CLIENTS.join(' > ')})`);
   return ytInstance;
 }
 

@@ -12,10 +12,9 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import ffmpegStatic from 'ffmpeg-static';
 
 // Prefer system ffmpeg (nixpacks/Railway) over ffmpeg-static bundled binary.
@@ -36,6 +35,7 @@ import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 import { createStream } from '../utils/youtube.js';
+import { getCookieFilePath } from '../utils/cookies.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -96,45 +96,22 @@ function ytdlpCmd() {
   return { bin, pre };
 }
 
-// YouTube cookie support for yt-dlp (bypasses bot checks on datacenter IPs).
-let _cookieFileCache;
+// YouTube cookies for yt-dlp come from the yt-cookies.txt jar (see src/utils/cookies.js).
+// Bypasses bot checks and age gates on datacenter IPs.
+let _cookieLogged = false;
 function resolveCookieFile() {
-  if (_cookieFileCache !== undefined) return _cookieFileCache;
-
-  if (process.env.YOUTUBE_COOKIE_FILE && existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
-    _cookieFileCache = process.env.YOUTUBE_COOKIE_FILE;
-  } else if (process.env.YOUTUBE_COOKIE?.trim()) {
-    try {
-      const p = join(tmpdir(), 'yt-cookies.txt');
-      let contents = process.env.YOUTUBE_COOKIE.trim();
-      // Convert browser cookie header format to Netscape format if needed
-      if (!contents.startsWith('# Netscape') && !contents.startsWith('# HTTP')) {
-        if (contents.includes(';') && !contents.includes('\t')) {
-          const pairs = contents.split(';').map(s => s.trim()).filter(Boolean);
-          const lines = ['# Netscape HTTP Cookie File'];
-          for (const pair of pairs) {
-            const eqIdx = pair.indexOf('=');
-            if (eqIdx === -1) continue;
-            const name = pair.substring(0, eqIdx).trim();
-            const value = pair.substring(eqIdx + 1).trim();
-            lines.push(`.youtube.com\tTRUE\t/\tTRUE\t0\t${name}\t${value}`);
-          }
-          contents = lines.join('\n');
-        } else {
-          contents = '# Netscape HTTP Cookie File\n' + contents;
-        }
-      }
-      writeFileSync(p, contents);
-      _cookieFileCache = p;
-      console.log('[player] wrote YouTube cookies to', p);
-    } catch (err) {
-      console.warn('[player] failed to write cookies:', err.message);
-      _cookieFileCache = null;
-    }
-  } else {
-    _cookieFileCache = null;
+  const path = getCookieFilePath();
+  if (path && !_cookieLogged) {
+    console.log(`[player] yt-dlp will use cookies: ${path}`);
+    _cookieLogged = true;
   }
-  return _cookieFileCache;
+  return path;
+}
+
+/** Cookie args, if a cookie jar is available. Must be included in EVERY yt-dlp invocation. */
+function cookieArgs() {
+  const cookies = resolveCookieFile();
+  return cookies ? ['--cookies', cookies] : [];
 }
 
 /** yt-dlp args for mobile client spoofing + optional cookies. */
@@ -1092,6 +1069,7 @@ export class Player {
           '--extractor-retries', '5',
           '--no-check-certificate',
           '--referer', 'https://www.youtube.com/',
+          ...cookieArgs(),
         ],
       },
       {
@@ -1102,6 +1080,7 @@ export class Player {
           '--extractor-retries', '5',
           '--no-check-certificate',
           '--referer', 'https://www.youtube.com/',
+          ...cookieArgs(),
         ],
       },
       {
@@ -1111,6 +1090,7 @@ export class Player {
           '--extractor-args', 'youtube:player_client=mweb',
           '--extractor-retries', '5',
           '--no-check-certificate',
+          ...cookieArgs(),
         ],
       },
       {
@@ -1120,6 +1100,7 @@ export class Player {
           '--extractor-args', 'youtube:player_client=android',
           '--extractor-retries', '5',
           '--no-check-certificate',
+          ...cookieArgs(),
         ],
       },
       {
@@ -1129,6 +1110,7 @@ export class Player {
           '--extractor-args', 'youtube:player_client=ios',
           '--extractor-retries', '5',
           '--no-check-certificate',
+          ...cookieArgs(),
         ],
       },
     ];
@@ -1352,7 +1334,7 @@ export class Player {
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
     if (/age.?restrict|confirm your age/i.test(msg)) return 'the video is age-restricted.';
     if (/confirm.*not a bot|sign in to confirm/i.test(msg)) {
-      return 'YouTube blocked this server (bot check). Add YOUTUBE_COOKIE or YTDLP_PROXIES in .env.';
+      return 'YouTube blocked this server (bot check). Refresh yt-cookies.txt or set YTDLP_PROXIES.';
     }
     if (/429|rate/i.test(msg)) return 'YouTube is rate-limiting. Add YTDLP_PROXIES with residential proxies.';
     if (/no.*format|playable/i.test(msg)) return 'no playable audio stream found.';
