@@ -17,18 +17,22 @@ let ytReady = false;
  * InnerTube clients to try, in order, when resolving an audio stream.
  * Configurable via YOUTUBE_CLIENTS (comma-separated).
  *
- * Order matters. With an authenticated cookie jar, the mobile/embedded clients
- * (VISIONOS, IOS, ANDROID_VR) reject the request — YouTube answers HTTP 400
- * "Request contains an invalid argument" because those clients aren't expected to carry
- * web session cookies. MWEB and WEB accept the cookies and return age-restricted audio,
- * so they lead. Verified against a real jar: MWEB/WEB/WEB_CREATOR return OK with audio
- * formats for both normal and age-restricted videos.
+ * Order matters, and it is driven by which clients produce stream URLs that actually SERVE
+ * BYTES — not just which ones return metadata. Verified against a real cookie jar:
  *
- * Valid: VISIONOS, IOS, MWEB, ANDROID_VR, WEB, WEB_CREATOR, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
+ *   VISIONOS / IOS / ANDROID_VR → stream URL returns HTTP 206, plays to completion
+ *   MWEB / WEB                  → metadata OK, but the stream URL returns HTTP 403 on the
+ *                                 ranged chunk fetch (these clients need a PoToken for
+ *                                 playback), which truncates long tracks mid-song
+ *
+ * So mobile clients lead. MWEB/WEB stay as a fallback because they're the only ones that
+ * return metadata for age-restricted videos when cookies are present.
+ *
+ * Valid: VISIONOS, IOS, ANDROID_VR, MWEB, WEB, WEB_CREATOR, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
  */
 const STREAM_CLIENTS = (process.env.YOUTUBE_CLIENTS?.trim()
   ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
-  : ['MWEB', 'WEB', 'WEB_CREATOR', 'VISIONOS', 'IOS', 'ANDROID_VR']);
+  : ['VISIONOS', 'IOS', 'ANDROID_VR', 'MWEB', 'WEB', 'WEB_CREATOR']);
 
 /** Kept for the metadata helpers below. */
 const NO_POTOKEN_CLIENTS = STREAM_CLIENTS;
@@ -263,6 +267,50 @@ function pickAudioFormat(info) {
 }
 
 /**
+ * Pull the first chunk from a lazily-fetched web stream so a 403 surfaces here rather than
+ * mid-playback, then hand back a Node Readable with that chunk pushed back in front.
+ *
+ * @param {ReadableStream} webStream
+ * @returns {Promise<Readable>}
+ */
+async function probeReadable(webStream) {
+  const reader = webStream.getReader();
+
+  let first;
+  try {
+    first = await reader.read();
+  } catch (err) {
+    try { reader.releaseLock(); } catch {}
+    try { await webStream.cancel(); } catch {}
+    throw err;
+  }
+
+  // Rebuild a Node stream: the already-read chunk first, then the rest of the reader.
+  const out = new Readable({
+    read() {
+      reader.read().then(
+        ({ done, value }) => {
+          this.push(done ? null : value);
+        },
+        (err) => this.destroy(err),
+      );
+    },
+    destroy(err, cb) {
+      reader.cancel().catch(() => {});
+      cb(err);
+    },
+  });
+
+  if (first.done) {
+    out.push(null);
+  } else {
+    out.push(first.value);
+  }
+
+  return out;
+}
+
+/**
  * Create an audio stream for a video, trying each InnerTube client in turn.
  *
  * YouTube accepts a given client's stream URLs inconsistently (403s vary by client, video and
@@ -331,8 +379,25 @@ export async function createStream(videoId, { exclude } = {}) {
       continue;
     }
 
-    const stream = Readable.fromWeb(webStream);
-    // Prevent unhandled 'error' before the resource is committed; the player logs real errors.
+    // Probe the stream URL before committing to this client.
+    //
+    // info.download() is lazy: it returns a ReadableStream that only fetches the first
+    // ranged chunk when the consumer pulls. Some clients (MWEB/WEB without a PoToken) hand
+    // back metadata and a URL that then answers 403. Without this check the failure surfaces
+    // mid-playback as a truncated track, and the client fallback loop is already gone —
+    // the player just sees a stream that ended early and advances to the next song.
+    let probeStream;
+    try {
+      probeStream = await probeReadable(webStream);
+    } catch (err) {
+      const detail = describeStreamError(err);
+      failures.push(`${client}: ${detail}`);
+      console.log(`[youtube] ${client} stream check failed: ${detail}`);
+      continue;
+    }
+
+    const stream = probeStream;
+    // Surface post-commit errors loudly; the player decides whether to recover.
     stream.on('error', (err) => {
       console.warn(`[youtube] stream error (client=${client}, itag=${format.itag}): ${describeStreamError(err)}`);
     });
