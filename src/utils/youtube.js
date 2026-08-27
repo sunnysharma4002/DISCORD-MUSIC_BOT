@@ -7,8 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(dirname(__dirname));
 const cacheDir = join(projectRoot, '.cache', 'youtubei');
 
+import { existsSync, readdirSync, rmSync } from 'node:fs';
+
 let ytInstance = null;
 let ytReady = false;
+let _regenAttempts = 0;
+const MAX_REGEN_ATTEMPTS = 3;
 
 /**
  * Clients that work WITHOUT po_token (no botguard challenge needed).
@@ -50,8 +54,15 @@ function parseCookieString(raw) {
  * Automatically generates visitor data and session — no manual config needed.
  * If YOUTUBE_COOKIE is set, it's used for age-restricted videos.
  */
-async function getYouTube() {
-  if (ytInstance && ytReady) return ytInstance;
+async function getYouTube(regenerate = false) {
+  if (ytInstance && ytReady && !regenerate) return ytInstance;
+  if (regenerate) {
+    _regenAttempts++;
+    console.log(`[youtube] regenerating session (attempt ${_regenAttempts}/${MAX_REGEN_ATTEMPTS})...`);
+    try { rmSync(cacheDir, { recursive: true, force: true }); } catch {}
+    ytInstance = null;
+    ytReady = false;
+  }
 
   Log.setLevel(Log.Level.ERROR);
 
@@ -64,8 +75,10 @@ async function getYouTube() {
   };
 
   const cookie = parseCookieString(process.env.YOUTUBE_COOKIE);
-  const poToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
-  const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || undefined;
+  // Only use manual tokens if explicitly set and non-empty.
+  // Otherwise let youtubei.js auto-generate visitor_data and po_token.
+  const poToken = (process.env.YOUTUBE_PO_TOKEN?.trim()?.length > 0) ? process.env.YOUTUBE_PO_TOKEN.trim() : undefined;
+  const visitorData = (process.env.YOUTUBE_VISITOR_DATA?.trim()?.length > 0) ? process.env.YOUTUBE_VISITOR_DATA.trim() : undefined;
 
   ytInstance = await Innertube.create({
     cache: new UniversalCache(true, cacheDir),
@@ -75,8 +88,16 @@ async function getYouTube() {
   });
 
   ytReady = true;
-  console.log(`[youtube] InnerTube client ready (poToken=${poToken ? 'yes' : 'no'} visitorData=${visitorData ? 'yes' : 'no'})`);
+  console.log(`[youtube] InnerTube client ready (poToken=${poToken ? 'yes' : 'auto'} visitorData=${visitorData ? 'yes' : 'auto'})`);
   return ytInstance;
+}
+
+export async function resetYouTubeSession() {
+  console.log('[youtube] resetting youtubei.js session...');
+  try { rmSync(cacheDir, { recursive: true, force: true }); } catch {}
+  ytInstance = null;
+  ytReady = false;
+  _regenAttempts = 0;
 }
 
 /** Search YouTube and return up to `limit` video results. */
@@ -198,6 +219,7 @@ export async function getStreamUrl(videoId) {
 export async function createStream(videoId) {
   const yt = await getYouTube();
   let lastError = null;
+  let loginRequired = false;
 
   for (const client of NO_POTOKEN_CLIENTS) {
     try {
@@ -206,6 +228,7 @@ export async function createStream(videoId) {
       const status = info.playability_status?.status;
       if (status && status !== 'OK') {
         console.debug(`[youtube] ${client} not playable: ${status}`);
+        if (status === 'LOGIN_REQUIRED') loginRequired = true;
         continue;
       }
 
@@ -236,6 +259,34 @@ export async function createStream(videoId) {
 
   if (lastError) {
     console.warn(`[youtube] createStream failed for ${videoId}: ${lastError.message}`);
+  }
+  // Auto-regenerate session if all clients returned LOGIN_REQUIRED (session expired)
+  if (loginRequired && _regenAttempts < MAX_REGEN_ATTEMPTS) {
+    console.warn('[youtube] all clients returned LOGIN_REQUIRED, regenerating session...');
+    await resetYouTubeSession();
+    const yt2 = await getYouTube();
+    for (const client of NO_POTOKEN_CLIENTS) {
+      try {
+        const info = await yt2.getBasicInfo(videoId, { client });
+        const status = info.playability_status?.status;
+        if (status && status !== 'OK') {
+          console.debug(`[youtube] regen ${client} not playable: ${status}`);
+          continue;
+        }
+        const formats = (info.streaming_data?.adaptive_formats ?? [])
+          .filter((f) => f.has_audio && !f.has_video && f.url && !f.drm_families?.length);
+        if (formats.length === 0) continue;
+        const opus = formats.filter((f) => /webm/i.test(f.mime_type) && /opus/i.test(f.mime_type));
+        const pool = opus.length ? opus : formats;
+        const best = pool.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+        console.log(`[youtube] stream via ${client} (regenerated): ${best.mime_type}`);
+        const webStream = await info.download({ itag: best.itag, type: 'audio' });
+        const stream = Readable.fromWeb(webStream);
+        return { stream, isOpus: opus.includes(best), client };
+      } catch (err) {
+        console.debug(`[youtube] regen ${client} failed: ${err.message}`);
+      }
+    }
   }
   return null;
 }
