@@ -2,7 +2,7 @@ import { Innertube, Log, Platform, UniversalCache } from 'youtubei.js';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { getCookieHeader } from './cookies.js';
+import { getCookieHeader, validateCookieSession, resetCookieCache } from './cookies.js';
 import { generatePoToken } from './potoken.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,27 +30,35 @@ const SESSION_REFRESH_MS = (() => {
 
 /**
  * InnerTube clients to try, in order, when resolving an audio stream.
- * Configurable via YOUTUBE_CLIENTS (comma-separated).
  *
- * Order matters, and it is driven by which clients produce stream URLs that actually SERVE
- * BYTES — not just which ones return metadata. Verified against a real cookie jar:
+ * Which clients work depends on whether the session is signed in, and the two sets are
+ * almost disjoint. Measured against a live cookie jar (BYTES = full track streamed):
  *
- *   VISIONOS / IOS / ANDROID_VR → stream URL returns HTTP 206, plays to completion
- *   MWEB / WEB                  → metadata OK, but the stream URL returns HTTP 403 on the
- *                                 ranged chunk fetch (these clients need a PoToken for
- *                                 playback), which truncates long tracks mid-song
+ *                  logged in     anonymous
+ *   VISIONOS       HTTP 400      BYTES
+ *   IOS            HTTP 400      BYTES
+ *   ANDROID_VR     HTTP 400      BYTES
+ *   MWEB           403 >100KB    403 >100KB
+ *   WEB_CREATOR    403 >100KB    LOGIN_REQUIRED
  *
- * So mobile clients lead. MWEB/WEB stay as a fallback because they're the only ones that
- * return metadata for age-restricted videos when cookies are present.
+ * Mobile clients reject session cookies outright ("Request contains an invalid argument").
+ * MWEB and WEB_CREATOR return OK metadata and serve small ranges, but 403 on any chunk above
+ * ~100KB — youtubei.js fetches in 10MB chunks, so they never deliver a track. They stay last
+ * as a metadata fallback only. Ordering by the wrong set costs dead round-trips per track
+ * and, when nothing is left, a spurious "bot check" verdict.
  *
+ * Override with YOUTUBE_CLIENTS to pin an explicit order.
  * Valid: VISIONOS, IOS, ANDROID_VR, MWEB, WEB, WEB_CREATOR, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
  */
-const STREAM_CLIENTS = (process.env.YOUTUBE_CLIENTS?.trim()
-  ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
-  : ['VISIONOS', 'IOS', 'ANDROID_VR', 'MWEB', 'WEB', 'WEB_CREATOR']);
+const CLIENTS_LOGGED_IN = ['MWEB', 'WEB_CREATOR'];
+const CLIENTS_ANONYMOUS = ['VISIONOS', 'IOS', 'ANDROID_VR', 'MWEB'];
 
-/** Kept for the metadata helpers below. */
-const NO_POTOKEN_CLIENTS = STREAM_CLIENTS;
+const CLIENTS_OVERRIDE = process.env.YOUTUBE_CLIENTS?.trim()
+  ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
+  : null;
+
+/** Clients for the session we actually built; set by buildInnertube(). */
+let STREAM_CLIENTS = CLIENTS_OVERRIDE ?? CLIENTS_ANONYMOUS;
 
 /**
  * Playability statuses that mean the video itself is unplayable — no extractor will help.
@@ -88,15 +96,43 @@ function isPermanentFailure(status, reason = '') {
 /**
  * Build a fresh InnerTube client with an auto-minted PoToken.
  *
- * A PoToken must be bound to the visitor_data of the session that uses it, so the order is:
- *   1. create a throwaway client to obtain visitor_data
- *   2. mint a PoToken bound to it
- *   3. create the real client with both
+ * A PoToken is bound to an identifier, and WHICH identifier depends on the session:
+ *   - anonymous session → bind to visitor_data
+ *   - signed-in session → bind to the Data Sync ID
+ * Binding to the wrong one makes YouTube answer LOGIN_REQUIRED / "not a bot" even though a
+ * valid token was minted, so we validate the cookie jar first to know which case we're in.
+ *
+ * A jar that is expired or revoked is dropped entirely: youtubei.js infers `logged_in` from
+ * SAPISID alone, so a dead jar makes it attach auth headers that don't authenticate — worse
+ * than no cookies at all on a flagged IP.
  *
  * If minting fails we still return a usable (token-less) client — better degraded than dead.
  */
 async function buildInnertube() {
-  const cookie = getCookieHeader();
+  // Validate the jar so we can log its real state, then decide whether to use it.
+  const session = await validateCookieSession();
+
+  // IMPORTANT: cookies are deliberately NOT used for youtubei.js streaming.
+  //
+  // Measured with a live, genuinely signed-in jar: a logged-in InnerTube session cannot
+  // stream at all. Mobile clients reject session cookies with HTTP 400, and MWEB/WEB_CREATOR
+  // return OK metadata but 403 on any ranged chunk above ~100KB — so every track dies on its
+  // first real chunk. Anonymous sessions stream every non-age-gated video to completion.
+  //
+  // Cookies are still passed to yt-dlp (see Player.js), which authenticates differently and
+  // is the fallback path for age-restricted videos.
+  //
+  // Set YOUTUBE_USE_COOKIES=true to force cookies into youtubei.js anyway.
+  const forceCookies = /^(1|true|yes)$/i.test(process.env.YOUTUBE_USE_COOKIES?.trim() ?? '');
+  const useCookies = forceCookies && session.loggedIn;
+  const cookie = useCookies ? getCookieHeader() : undefined;
+
+  if (session.loggedIn && !useCookies) {
+    console.log('[youtube] cookie jar is valid but not used for streaming (anonymous streams reliably); yt-dlp still uses it');
+  }
+
+  // Client order depends on session type — the two working sets barely overlap.
+  STREAM_CLIENTS = CLIENTS_OVERRIDE ?? (useCookies ? CLIENTS_LOGGED_IN : CLIENTS_ANONYMOUS);
 
   // Explicit env values win, so a known-good pair can be pinned if ever needed.
   const envPoToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
@@ -126,12 +162,16 @@ async function buildInnertube() {
     return Innertube.create({ cache: new UniversalCache(true, cacheDir), cookie });
   }
 
-  // Step 2 — mint a PoToken bound to that visitor_data.
+  // Step 2 — mint a PoToken bound to the identifier this session type requires.
+  // Anonymous session → visitor_data. Signed-in session → Data Sync ID.
+  const binding = useCookies && session.dataSyncId ? session.dataSyncId : visitorData;
+  const bindingKind = binding === visitorData ? 'visitor_data' : 'datasync_id';
+
   let poToken;
   try {
     const t0 = Date.now();
-    poToken = await generatePoToken(visitorData);
-    console.log(`[youtube] minted PoToken (${poToken.length} chars) in ${Date.now() - t0}ms`);
+    poToken = await generatePoToken(binding);
+    console.log(`[youtube] minted PoToken (${poToken.length} chars, bound to ${bindingKind}) in ${Date.now() - t0}ms`);
   } catch (err) {
     console.warn(`[youtube] PoToken generation failed: ${err.message}`);
     console.warn('[youtube] continuing without a PoToken — expect LOGIN_REQUIRED on some videos');
@@ -175,7 +215,7 @@ async function getYouTube() {
       _sessionCreatedAt = Date.now();
       const hasToken = Boolean(yt.session?.po_token);
       console.log(
-        `[youtube] InnerTube client ready (cookies=${getCookieHeader() ? 'yes' : 'no'}, ` +
+        `[youtube] InnerTube client ready (auth=${yt.session?.logged_in ? 'signed-in' : 'anonymous'}, ` +
         `poToken=${hasToken ? 'yes' : 'no'}, clients: ${STREAM_CLIENTS.join(' > ')})`,
       );
       startSessionRefresh();
@@ -204,6 +244,8 @@ export async function refreshSession(reason = 'timer') {
 
   try {
     console.log(`[youtube] refreshing session (${reason})...`);
+    // Re-read and re-validate the jar: it may have been replaced, or have expired since.
+    resetCookieCache();
     const next = await buildInnertube();
     ytInstance = next;
     ytReady = true;
@@ -297,7 +339,7 @@ export async function getVideoInfo(videoId) {
   const yt = await getYouTube();
   let lastError = null;
 
-  for (const client of NO_POTOKEN_CLIENTS) {
+  for (const client of STREAM_CLIENTS) {
     try {
       const info = await yt.getBasicInfo(videoId, { client });
       const basic = info.basic_info ?? {};
@@ -329,7 +371,7 @@ export async function getStreamUrl(videoId) {
   const yt = await getYouTube();
   let lastError = null;
 
-  for (const client of NO_POTOKEN_CLIENTS) {
+  for (const client of STREAM_CLIENTS) {
     try {
       const info = await yt.getBasicInfo(videoId, { client });
 
