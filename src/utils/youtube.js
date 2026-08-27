@@ -11,14 +11,27 @@ import { existsSync, readdirSync, rmSync } from 'node:fs';
 
 let ytInstance = null;
 let ytReady = false;
-let _regenAttempts = 0;
-const MAX_REGEN_ATTEMPTS = 3;
 
 /**
- * Clients that work WITHOUT po_token (no botguard challenge needed).
- * Order matches Redux-Music-Bot which works: VISIONOS is key — it's rarely blocked.
+ * InnerTube clients to try, in order, when resolving an audio stream.
+ * Configurable via YOUTUBE_CLIENTS (comma-separated). Matches Redux-Music-Bot defaults.
+ * Valid: VISIONOS, IOS, MWEB, ANDROID_VR, WEB, ANDROID, TV_EMBEDDED, WEB_EMBEDDED
  */
-const NO_POTOKEN_CLIENTS = ['VISIONOS', 'IOS', 'MWEB', 'ANDROID_VR'];
+const STREAM_CLIENTS = (process.env.YOUTUBE_CLIENTS?.trim()
+  ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
+  : ['VISIONOS', 'IOS', 'MWEB', 'ANDROID_VR', 'TV_EMBEDDED', 'WEB_EMBEDDED']);
+
+/** Kept for the metadata helpers below. */
+const NO_POTOKEN_CLIENTS = STREAM_CLIENTS;
+
+/** Playability statuses that mean "this video will never work" — skip, don't retry. */
+const PERMANENT_FAILURES = new Set([
+  'LOGIN_REQUIRED',
+  'AGE_CHECK_REQUIRED',
+  'CONTENT_CHECK_REQUIRED',
+  'UNPLAYABLE',
+  'LIVE_STREAM_OFFLINE',
+]);
 
 /**
  * Parse Netscape cookie file format into a Cookie header string for youtubei.js.
@@ -54,15 +67,8 @@ function parseCookieString(raw) {
  * Automatically generates visitor data and session — no manual config needed.
  * If YOUTUBE_COOKIE is set, it's used for age-restricted videos.
  */
-async function getYouTube(regenerate = false) {
-  if (ytInstance && ytReady && !regenerate) return ytInstance;
-  if (regenerate) {
-    _regenAttempts++;
-    console.log(`[youtube] regenerating session (attempt ${_regenAttempts}/${MAX_REGEN_ATTEMPTS})...`);
-    try { rmSync(cacheDir, { recursive: true, force: true }); } catch {}
-    ytInstance = null;
-    ytReady = false;
-  }
+async function getYouTube() {
+  if (ytInstance && ytReady) return ytInstance;
 
   Log.setLevel(Log.Level.ERROR);
 
@@ -88,7 +94,7 @@ async function getYouTube(regenerate = false) {
   });
 
   ytReady = true;
-  console.log(`[youtube] InnerTube client ready (poToken=${poToken ? 'yes' : 'auto'} visitorData=${visitorData ? 'yes' : 'auto'})`);
+  console.log(`[youtube] InnerTube client ready (clients: ${STREAM_CLIENTS.join(' > ')})`);
   return ytInstance;
 }
 
@@ -97,7 +103,6 @@ export async function resetYouTubeSession() {
   try { rmSync(cacheDir, { recursive: true, force: true }); } catch {}
   ytInstance = null;
   ytReady = false;
-  _regenAttempts = 0;
 }
 
 /** Search YouTube and return up to `limit` video results. */
@@ -212,83 +217,140 @@ export async function getStreamUrl(videoId) {
 }
 
 /**
- * Create an audio stream for a video.
- * Returns { stream: Readable, isOpus: boolean, client: string } or null.
- * Uses demuxProbe-compatible approach: Opus streams can be played directly without ffmpeg.
+ * Builds a diagnostic, single-line description of a streaming error, pulling out the rich
+ * detail youtubei.js attaches (`error.info`) that Discord's AudioPlayerError strips away.
  */
-export async function createStream(videoId) {
+export function describeStreamError(error) {
+  if (!error) return 'unknown error';
+  const info = error.info ?? error.cause?.info ?? {};
+  const response = info.response;
+  const message = error.message || error.name || String(error);
+  const meta = [];
+  if (info.error_type) meta.push(info.error_type);
+  if (response?.status) meta.push(`HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`);
+  return meta.length ? `${message} [${meta.join(', ')}]` : message;
+}
+
+/** Human-readable reasons for playability statuses that can never be worked around. */
+const PLAYABILITY_MESSAGES = {
+  LOGIN_REQUIRED: 'This video requires signing in (age-restricted or private).',
+  UNPLAYABLE: 'YouTube reports this video as unplayable.',
+  LIVE_STREAM_OFFLINE: 'This live stream is not currently live.',
+  CONTENT_CHECK_REQUIRED: 'This video requires a content check the bot cannot complete.',
+  AGE_CHECK_REQUIRED: 'This video is age-restricted.',
+  ERROR: 'YouTube returned an error for this video.',
+};
+
+/**
+ * Pick the best audio-only format, preferring Opus (no transcoding) and the original language.
+ * Mirrors Redux-Music-Bot's pickAudioFormat.
+ */
+function pickAudioFormat(info) {
+  const formats = (info.streaming_data?.adaptive_formats ?? []).filter(
+    (f) => f.has_audio && !f.has_video && !f.drm_families?.length,
+  );
+  if (!formats.length) return null;
+
+  const originals = formats.filter((f) => f.is_original !== false && !f.is_dubbed && !f.is_descriptive);
+  const pool = originals.length ? originals : formats;
+  const opus = pool.filter((f) => /webm/i.test(f.mime_type) && /opus/i.test(f.mime_type));
+  const chosen = opus.length ? opus : pool;
+  const best = chosen.slice().sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+  return Object.assign(best, { isOpus: opus.includes(best) });
+}
+
+/**
+ * Create an audio stream for a video, trying each InnerTube client in turn.
+ *
+ * YouTube accepts a given client's stream URLs inconsistently (403s vary by client, video and
+ * server IP), so we fall through to the next client on any failure. `exclude` lets the caller
+ * skip clients that already failed for this track — used to recover mid-playback.
+ *
+ * Returns { stream, isOpus, client, isLive, hlsUrl } or throws a StreamError-like Error with
+ * `.permanent = true` when the video can never be played (DRM, login required, etc).
+ */
+export async function createStream(videoId, { exclude } = {}) {
   const yt = await getYouTube();
-  let lastError = null;
-  let loginRequired = false;
+  const excluded = exclude instanceof Set ? exclude : new Set(exclude ?? []);
+  const clients = STREAM_CLIENTS.filter((c) => !excluded.has(c));
+  const failures = [];
+  let playability = null;
 
-  for (const client of NO_POTOKEN_CLIENTS) {
+  for (const client of clients) {
+    let info;
     try {
-      const info = await yt.getBasicInfo(videoId, { client });
-
-      const status = info.playability_status?.status;
-      if (status && status !== 'OK') {
-        console.debug(`[youtube] ${client} not playable: ${status}`);
-        if (status === 'LOGIN_REQUIRED') loginRequired = true;
-        continue;
-      }
-
-      const formats = (info.streaming_data?.adaptive_formats ?? [])
-        .filter((f) => f.has_audio && !f.has_video && f.url && !f.drm_families?.length);
-
-      if (formats.length === 0) {
-        console.debug(`[youtube] ${client} no audio formats for ${videoId}`);
-        continue;
-      }
-
-      // Prefer Opus (no transcoding needed), then highest bitrate
-      const opus = formats.filter((f) => /webm/i.test(f.mime_type) && /opus/i.test(f.mime_type));
-      const pool = opus.length ? opus : formats;
-      const best = pool.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-
-      console.log(`[youtube] stream via ${client}: ${best.mime_type} ${best.bitrate ? `${Math.round(best.bitrate / 1000)}kbps` : ''}`);
-
-      const webStream = await info.download({ itag: best.itag, type: 'audio' });
-      const stream = Readable.fromWeb(webStream);
-
-      return { stream, isOpus: opus.includes(best), client };
+      info = await yt.getBasicInfo(videoId, { client });
     } catch (err) {
-      lastError = err;
-      console.debug(`[youtube] ${client} createStream failed for ${videoId}: ${err.message}`);
+      const detail = describeStreamError(err);
+      failures.push(`${client}: ${detail}`);
+      console.log(`[youtube] ${client} getBasicInfo failed: ${detail}`);
+      continue;
     }
+
+    const status = info.playability_status?.status;
+    if (status && status !== 'OK') {
+      playability = playability ?? status;
+      const reason = info.playability_status?.reason ? ` (${info.playability_status.reason})` : '';
+      failures.push(`${client}: ${status}${reason}`);
+      console.log(`[youtube] ${client} not playable: ${status}${reason}`);
+      continue;
+    }
+
+    // Live streams: hand the HLS manifest back so the caller can feed ffmpeg.
+    if (info.basic_info?.is_live) {
+      const hls = info.streaming_data?.hls_manifest_url;
+      if (!hls) {
+        failures.push(`${client}: live stream without HLS manifest`);
+        continue;
+      }
+      console.log(`[youtube] live stream via ${client} (HLS)`);
+      return { stream: null, isOpus: false, client, isLive: true, hlsUrl: hls };
+    }
+
+    const format = pickAudioFormat(info);
+    if (!format) {
+      failures.push(`${client}: no audio formats`);
+      continue;
+    }
+
+    let webStream;
+    try {
+      webStream = await info.download({ itag: format.itag, type: 'audio' });
+    } catch (err) {
+      const detail = describeStreamError(err);
+      failures.push(`${client}: ${detail}`);
+      console.log(`[youtube] ${client} download() failed: ${detail}`);
+      continue;
+    }
+
+    const stream = Readable.fromWeb(webStream);
+    // Prevent unhandled 'error' before the resource is committed; the player logs real errors.
+    stream.on('error', (err) => {
+      console.warn(`[youtube] stream error (client=${client}, itag=${format.itag}): ${describeStreamError(err)}`);
+    });
+
+    console.log(`[youtube] stream via ${client}: ${format.mime_type} ${format.bitrate ? `${Math.round(format.bitrate / 1000)}kbps` : ''}`);
+    return { stream, isOpus: format.isOpus, client, isLive: false, hlsUrl: null };
   }
 
-  if (lastError) {
-    console.warn(`[youtube] createStream failed for ${videoId}: ${lastError.message}`);
+  if (failures.length) {
+    console.warn(`[youtube] could not stream ${videoId}: ${failures.join(' | ')}`);
   }
-  // Auto-regenerate session if all clients returned LOGIN_REQUIRED (session expired)
-  if (loginRequired && _regenAttempts < MAX_REGEN_ATTEMPTS) {
-    console.warn('[youtube] all clients returned LOGIN_REQUIRED, regenerating session...');
-    await resetYouTubeSession();
-    const yt2 = await getYouTube();
-    for (const client of NO_POTOKEN_CLIENTS) {
-      try {
-        const info = await yt2.getBasicInfo(videoId, { client });
-        const status = info.playability_status?.status;
-        if (status && status !== 'OK') {
-          console.debug(`[youtube] regen ${client} not playable: ${status}`);
-          continue;
-        }
-        const formats = (info.streaming_data?.adaptive_formats ?? [])
-          .filter((f) => f.has_audio && !f.has_video && f.url && !f.drm_families?.length);
-        if (formats.length === 0) continue;
-        const opus = formats.filter((f) => /webm/i.test(f.mime_type) && /opus/i.test(f.mime_type));
-        const pool = opus.length ? opus : formats;
-        const best = pool.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-        console.log(`[youtube] stream via ${client} (regenerated): ${best.mime_type}`);
-        const webStream = await info.download({ itag: best.itag, type: 'audio' });
-        const stream = Readable.fromWeb(webStream);
-        return { stream, isOpus: opus.includes(best), client };
-      } catch (err) {
-        console.debug(`[youtube] regen ${client} failed: ${err.message}`);
-      }
-    }
+
+  // A permanent playability failure means no extractor (yt-dlp included) will help.
+  if (playability && PERMANENT_FAILURES.has(playability)) {
+    const error = new Error(PLAYABILITY_MESSAGES[playability] ?? `YouTube refused this video (${playability}).`);
+    error.permanent = true;
+    error.playability = playability;
+    throw error;
   }
+
   return null;
+}
+
+/** Number of stream clients available — used to know when every client has been tried. */
+export function getStreamClientCount() {
+  return STREAM_CLIENTS.length;
 }
 
 /**

@@ -35,7 +35,7 @@ const ffmpegPath = (() => {
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import { getStreamUrl, createStream } from '../utils/youtube.js';
+import { createStream } from '../utils/youtube.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -814,28 +814,48 @@ export class Player {
       return this._streamDirect(track.audioUrl, track);
     }
 
-    // YouTube tracks: try youtubei.js directly (no relay needed)
+    // YouTube tracks: try youtubei.js first (matches Redux-Music-Bot's approach)
     if (track.source === 'youtube' && videoId) {
       console.log(`[player] trying youtubei.js for YouTube audio: ${videoId}`);
-      const streamData = await createStream(videoId);
+      let streamData = null;
+      try {
+        streamData = await createStream(videoId);
+      } catch (err) {
+        // Permanent failures (DRM, login required, age-gated) will never work via yt-dlp either.
+        if (err.permanent) {
+          console.warn(`[player] permanent failure for ${videoId}: ${err.message}`);
+          throw err;
+        }
+        console.warn(`[player] createStream error: ${err.message}`);
+      }
+
       if (streamData) {
-        console.log(`[player] youtubei.js stream obtained: isOpus=${streamData.isOpus} client=${streamData.client}`);
+        console.log(`[player] youtubei.js stream obtained: isOpus=${streamData.isOpus} client=${streamData.client} live=${streamData.isLive}`);
+
+        // Live stream — feed the HLS manifest to ffmpeg
+        if (streamData.isLive && streamData.hlsUrl) {
+          return this._streamViaFfmpegUrl(streamData.hlsUrl, track);
+        }
 
         if (streamData.isOpus) {
-          // Opus stream — Discord plays natively, no ffmpeg needed
-          const probe = await demuxProbe(streamData.stream);
-          const resource = createAudioResource(probe.stream, {
-            inputType: probe.type,
-            inlineVolume: true,
-            metadata: track,
-          });
-          // Track the readable so we can destroy it on stream error
-          resource.stream?.on?.('error', () => streamData.stream.destroy());
-          console.log(`[player] Opus resource created for "${track.title}"`);
-          return resource;
+          // Opus stream — demuxProbe confirms the URL is served and picks the demuxer.
+          // A 403 surfaces here so we can fall through to yt-dlp.
+          try {
+            const probe = await demuxProbe(streamData.stream);
+            const resource = createAudioResource(probe.stream, {
+              inputType: probe.type,
+              inlineVolume: true,
+              metadata: track,
+            });
+            console.log(`[player] Opus resource created for "${track.title}" (client=${streamData.client})`);
+            return resource;
+          } catch (err) {
+            streamData.stream.destroy();
+            console.warn(`[player] demuxProbe failed (${streamData.client}): ${err.message}`);
+          }
         } else {
-          // Non-Opus — transcode via ffmpeg
-          console.log(`[player] non-Opus stream, transcoding via ffmpeg`);
+          // Non-Opus (AAC etc.) — transcode via ffmpeg
+          console.log(`[player] non-Opus stream (${streamData.client}), transcoding via ffmpeg`);
           return this._streamViaFfmpegReadable(streamData.stream, track);
         }
       }
@@ -951,20 +971,18 @@ export class Player {
     }
   }
 
-  /** Stream audio from a URL via ffmpeg (for YouTube innerTube direct URLs). */
-  async _streamViaFfmpeg(audioUrl, track) {
-    // Deprecated: use _streamViaFfmpegReadable instead
-    throw new Error('Use _streamViaFfmpegReadable for Readable streams');
-  }
-
-  /** Transcode a Readable stream to raw PCM via ffmpeg (for non-Opus YouTube streams). */
+  /**
+   * Transcode a Readable stream to raw PCM via ffmpeg (for non-Opus YouTube streams).
+   * PCM (not Opus) is deliberate: @discordjs/voice applies inline volume before encoding itself,
+   * and ffmpeg's libopus can emit an empty stream for seeked segments.
+   */
   async _streamViaFfmpegReadable(readable, track) {
     if (!ffmpegPath) throw new Error('ffmpeg binary not found (ffmpeg-static failed to install).');
 
     console.log(`[player] ffmpeg transcoding via stdin...`);
 
     const args = [
-      '-hide_banner', '-loglevel', 'error',
+      '-hide_banner', '-loglevel', 'error', '-nostdin',
       '-i', 'pipe:0',
       '-vn', '-sn', '-dn',
       '-ar', '48000', '-ac', '2',
@@ -973,25 +991,29 @@ export class Player {
 
     const child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let stderr = '';
+    let finished = false;
 
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.stderr.on('data', (d) => { stderr = `${stderr}${d}`.slice(-2000); });
+    child.stdout.on('error', () => { /* consumed by the audio player */ });
 
     child.on('error', (err) => {
-      console.error(`[player] ffmpeg spawn error: ${err.message}`);
+      if (!finished) child.stdout.destroy(new Error(`ffmpeg failed to start: ${err.message}`));
     });
 
     child.on('close', (code) => {
+      if (finished) return;
+      finished = true;
       if (code !== 0 && code !== null) {
         console.warn(`[player] ffmpeg exited ${code}: ${stderr.trim().substring(0, 200)}`);
+        child.stdout.destroy(new Error(`ffmpeg exited ${code}`));
       }
     });
 
-    // Pipe the Readable stream into ffmpeg stdin
-    readable.pipe(child.stdin);
+    child.stdin.on('error', () => { /* ffmpeg closed early */ });
     readable.on('error', (err) => {
-      console.error(`[player] input stream error: ${err.message}`);
-      child.stdin.destroy();
+      if (!finished) child.stdout.destroy(err);
     });
+    readable.pipe(child.stdin);
 
     const resource = createAudioResource(child.stdout, {
       inputType: StreamType.Raw,
@@ -1000,6 +1022,51 @@ export class Player {
     });
 
     console.log(`[player] ffmpeg transcoded resource created for "${track.title}"`);
+    return resource;
+  }
+
+  /** Transcode a URL (HLS live manifest) to raw PCM via ffmpeg. */
+  async _streamViaFfmpegUrl(inputUrl, track) {
+    if (!ffmpegPath) throw new Error('ffmpeg binary not found (ffmpeg-static failed to install).');
+
+    console.log(`[player] ffmpeg streaming URL: ${inputUrl.substring(0, 80)}...`);
+
+    const args = [
+      '-hide_banner', '-loglevel', 'error', '-nostdin',
+      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+      '-i', inputUrl,
+      '-vn', '-sn', '-dn',
+      '-ar', '48000', '-ac', '2',
+      '-f', 's16le', 'pipe:1',
+    ];
+
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stderr = '';
+    let finished = false;
+
+    child.stderr.on('data', (d) => { stderr = `${stderr}${d}`.slice(-2000); });
+    child.stdout.on('error', () => {});
+
+    child.on('error', (err) => {
+      if (!finished) child.stdout.destroy(new Error(`ffmpeg failed to start: ${err.message}`));
+    });
+
+    child.on('close', (code) => {
+      if (finished) return;
+      finished = true;
+      if (code !== 0 && code !== null) {
+        console.warn(`[player] ffmpeg exited ${code}: ${stderr.trim().substring(0, 200)}`);
+        child.stdout.destroy(new Error(`ffmpeg exited ${code}`));
+      }
+    });
+
+    const resource = createAudioResource(child.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      metadata: track,
+    });
+
+    console.log(`[player] ffmpeg URL resource created for "${track.title}"`);
     return resource;
   }
 
@@ -1274,6 +1341,9 @@ export class Player {
 
   _friendlyError(err) {
     const msg = String(err?.message ?? '');
+    // Permanent playability failures from youtubei.js carry a clear message already.
+    if (err?.permanent) return msg;
+    if (/DRM protected/i.test(msg)) return 'the video is DRM protected and cannot be played.';
     if (/private video/i.test(msg)) return 'the video is private.';
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
     if (/age.?restrict|confirm your age/i.test(msg)) return 'the video is age-restricted.';
