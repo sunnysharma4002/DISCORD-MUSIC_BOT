@@ -829,7 +829,8 @@ export class Player {
             inlineVolume: true,
             metadata: track,
           });
-          resource.on('error', () => streamData.stream.destroy());
+          // Track the readable so we can destroy it on stream error
+          resource.stream?.on?.('error', () => streamData.stream.destroy());
           console.log(`[player] Opus resource created for "${track.title}"`);
           return resource;
         } else {
