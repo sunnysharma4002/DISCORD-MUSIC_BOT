@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getCookieHeader } from './cookies.js';
+import { generatePoToken } from './potoken.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(dirname(__dirname));
@@ -12,6 +13,20 @@ import { existsSync, readdirSync, rmSync } from 'node:fs';
 
 let ytInstance = null;
 let ytReady = false;
+let _buildPromise = null;
+let _refreshTimer = null;
+let _refreshing = false;
+let _sessionCreatedAt = 0;
+
+/**
+ * How often to re-mint the PoToken and rebuild the session.
+ * YouTube's tokens last roughly 6 hours; refreshing at 3 keeps us comfortably inside that.
+ * Override with YOUTUBE_REFRESH_HOURS.
+ */
+const SESSION_REFRESH_MS = (() => {
+  const hours = Number(process.env.YOUTUBE_REFRESH_HOURS);
+  return Number.isFinite(hours) && hours > 0 ? hours * 3_600_000 : 3 * 3_600_000;
+})();
 
 /**
  * InnerTube clients to try, in order, when resolving an audio stream.
@@ -71,11 +86,76 @@ function isPermanentFailure(status, reason = '') {
 }
 
 /**
+ * Build a fresh InnerTube client with an auto-minted PoToken.
+ *
+ * A PoToken must be bound to the visitor_data of the session that uses it, so the order is:
+ *   1. create a throwaway client to obtain visitor_data
+ *   2. mint a PoToken bound to it
+ *   3. create the real client with both
+ *
+ * If minting fails we still return a usable (token-less) client — better degraded than dead.
+ */
+async function buildInnertube() {
+  const cookie = getCookieHeader();
+
+  // Explicit env values win, so a known-good pair can be pinned if ever needed.
+  const envPoToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
+  const envVisitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || undefined;
+
+  if (envPoToken && envVisitorData) {
+    const yt = await Innertube.create({
+      cache: new UniversalCache(true, cacheDir),
+      cookie,
+      po_token: envPoToken,
+      visitor_data: envVisitorData,
+    });
+    console.log('[youtube] using pinned YOUTUBE_PO_TOKEN / YOUTUBE_VISITOR_DATA from env');
+    return yt;
+  }
+
+  // Step 1 — a bare client just to get session visitor_data.
+  const seed = await Innertube.create({
+    cache: new UniversalCache(true, cacheDir),
+    cookie,
+    retrieve_player: false,
+  });
+
+  const visitorData = envVisitorData ?? seed.session.context.client.visitorData;
+  if (!visitorData) {
+    console.warn('[youtube] no visitor_data available; continuing without a PoToken');
+    return Innertube.create({ cache: new UniversalCache(true, cacheDir), cookie });
+  }
+
+  // Step 2 — mint a PoToken bound to that visitor_data.
+  let poToken;
+  try {
+    const t0 = Date.now();
+    poToken = await generatePoToken(visitorData);
+    console.log(`[youtube] minted PoToken (${poToken.length} chars) in ${Date.now() - t0}ms`);
+  } catch (err) {
+    console.warn(`[youtube] PoToken generation failed: ${err.message}`);
+    console.warn('[youtube] continuing without a PoToken — expect LOGIN_REQUIRED on some videos');
+  }
+
+  // Step 3 — the real client.
+  return Innertube.create({
+    cache: new UniversalCache(true, cacheDir),
+    cookie,
+    po_token: poToken,
+    visitor_data: visitorData,
+  });
+}
+
+/**
  * Initialize the YouTube InnerTube client.
  * Cookies are read from the yt-cookies.txt jar (see src/utils/cookies.js), not from env.
+ * A PoToken is minted automatically and refreshed on a timer (see startSessionRefresh).
  */
 async function getYouTube() {
   if (ytInstance && ytReady) return ytInstance;
+
+  // Concurrent callers during startup must share one build, not race three of them.
+  if (_buildPromise) return _buildPromise;
 
   Log.setLevel(Log.Level.ERROR);
 
@@ -87,22 +167,85 @@ async function getYouTube() {
     return fn(...names.map((name) => env[name]));
   };
 
-  const cookie = getCookieHeader();
-  // Only use manual tokens if explicitly set and non-empty.
-  // Otherwise let youtubei.js auto-generate visitor_data and po_token.
-  const poToken = (process.env.YOUTUBE_PO_TOKEN?.trim()?.length > 0) ? process.env.YOUTUBE_PO_TOKEN.trim() : undefined;
-  const visitorData = (process.env.YOUTUBE_VISITOR_DATA?.trim()?.length > 0) ? process.env.YOUTUBE_VISITOR_DATA.trim() : undefined;
+  _buildPromise = (async () => {
+    try {
+      const yt = await buildInnertube();
+      ytInstance = yt;
+      ytReady = true;
+      _sessionCreatedAt = Date.now();
+      const hasToken = Boolean(yt.session?.po_token);
+      console.log(
+        `[youtube] InnerTube client ready (cookies=${getCookieHeader() ? 'yes' : 'no'}, ` +
+        `poToken=${hasToken ? 'yes' : 'no'}, clients: ${STREAM_CLIENTS.join(' > ')})`,
+      );
+      startSessionRefresh();
+      return yt;
+    } finally {
+      _buildPromise = null;
+    }
+  })();
 
-  ytInstance = await Innertube.create({
-    cache: new UniversalCache(true, cacheDir),
-    cookie,
-    po_token: poToken,
-    visitor_data: visitorData,
-  });
+  return _buildPromise;
+}
 
-  ytReady = true;
-  console.log(`[youtube] InnerTube client ready (cookies=${cookie ? 'yes' : 'no'}, clients: ${STREAM_CLIENTS.join(' > ')})`);
-  return ytInstance;
+/**
+ * Rebuild the session in place with a freshly minted PoToken.
+ *
+ * Safe to call mid-playback: already-open streams hold their own deciphered URLs and keep
+ * running. Only subsequent createStream() calls use the new session. The InnerTube cache is
+ * NOT cleared — clearing it forces a player re-download for no benefit.
+ */
+export async function refreshSession(reason = 'timer') {
+  if (_refreshing) {
+    console.log('[youtube] refresh already in progress, skipping');
+    return ytInstance;
+  }
+  _refreshing = true;
+
+  try {
+    console.log(`[youtube] refreshing session (${reason})...`);
+    const next = await buildInnertube();
+    ytInstance = next;
+    ytReady = true;
+    _sessionCreatedAt = Date.now();
+    console.log(`[youtube] session refreshed (poToken=${next.session?.po_token ? 'yes' : 'no'})`);
+    return next;
+  } catch (err) {
+    console.error(`[youtube] session refresh failed: ${err.message}`);
+    return ytInstance; // keep the old session rather than going dark
+  } finally {
+    _refreshing = false;
+  }
+}
+
+/** Starts the periodic refresh timer. Idempotent. */
+export function startSessionRefresh() {
+  if (_refreshTimer) return;
+
+  _refreshTimer = setInterval(() => {
+    refreshSession('scheduled').catch((err) => {
+      console.error(`[youtube] scheduled refresh threw: ${err.message}`);
+    });
+  }, SESSION_REFRESH_MS);
+
+  // Don't hold the event loop open on shutdown.
+  if (typeof _refreshTimer.unref === 'function') _refreshTimer.unref();
+
+  const hours = (SESSION_REFRESH_MS / 3_600_000).toFixed(1);
+  console.log(`[youtube] session auto-refresh every ${hours}h`);
+}
+
+/** Stops the periodic refresh timer. */
+export function stopSessionRefresh() {
+  if (_refreshTimer) {
+    clearInterval(_refreshTimer);
+    _refreshTimer = null;
+  }
+}
+
+/** Age of the current session in milliseconds. */
+export function getSessionAgeMs() {
+  return _sessionCreatedAt ? Date.now() - _sessionCreatedAt : 0;
 }
 
 export async function resetYouTubeSession() {
@@ -317,10 +460,13 @@ async function probeReadable(webStream) {
  * server IP), so we fall through to the next client on any failure. `exclude` lets the caller
  * skip clients that already failed for this track — used to recover mid-playback.
  *
+ * If every client reports a bot check, the session's PoToken has gone stale: we re-mint it
+ * once and retry immediately rather than waiting for the refresh timer.
+ *
  * Returns { stream, isOpus, client, isLive, hlsUrl } or throws a StreamError-like Error with
  * `.permanent = true` when the video can never be played (DRM, login required, etc).
  */
-export async function createStream(videoId, { exclude } = {}) {
+export async function createStream(videoId, { exclude, _retried = false } = {}) {
   const yt = await getYouTube();
   const excluded = exclude instanceof Set ? exclude : new Set(exclude ?? []);
   const clients = STREAM_CLIENTS.filter((c) => !excluded.has(c));
@@ -420,7 +566,14 @@ export async function createStream(videoId, { exclude } = {}) {
   }
 
   if (playability === 'LOGIN_REQUIRED' && BOT_CHECK_PATTERN.test(playabilityReason)) {
-    console.warn('[youtube] bot check on this IP — falling back to yt-dlp');
+    // A bot check across every client means our PoToken is stale or absent. Re-mint and retry
+    // once before handing off to yt-dlp — this is what keeps the bot alive past the token TTL.
+    if (!_retried) {
+      console.warn('[youtube] bot check on all clients — re-minting PoToken and retrying');
+      await refreshSession('bot-check');
+      return createStream(videoId, { exclude, _retried: true });
+    }
+    console.warn('[youtube] bot check persists after refresh — falling back to yt-dlp');
   }
 
   return null;
