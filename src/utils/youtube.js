@@ -24,14 +24,38 @@ const STREAM_CLIENTS = (process.env.YOUTUBE_CLIENTS?.trim()
 /** Kept for the metadata helpers below. */
 const NO_POTOKEN_CLIENTS = STREAM_CLIENTS;
 
-/** Playability statuses that mean "this video will never work" — skip, don't retry. */
+/**
+ * Playability statuses that mean the video itself is unplayable — no extractor will help.
+ *
+ * NOTE: LOGIN_REQUIRED is deliberately NOT here. YouTube returns it for two very different
+ * reasons and only the reason text tells them apart:
+ *   - "Sign in to confirm you're not a bot"  → datacenter IP block, transient, yt-dlp may work
+ *   - "Sign in to confirm your age" / private → genuinely gated, nothing will work
+ * See isPermanentFailure() below.
+ */
 const PERMANENT_FAILURES = new Set([
-  'LOGIN_REQUIRED',
   'AGE_CHECK_REQUIRED',
   'CONTENT_CHECK_REQUIRED',
   'UNPLAYABLE',
   'LIVE_STREAM_OFFLINE',
 ]);
+
+/** Reason substrings that mean "this is an IP/bot block", not a property of the video. */
+const BOT_CHECK_PATTERN = /not a bot|confirm you.re not|unusual traffic/i;
+
+/**
+ * Decide whether a playability status is worth giving up on entirely.
+ * @param {string} status
+ * @param {string} [reason]
+ */
+function isPermanentFailure(status, reason = '') {
+  if (PERMANENT_FAILURES.has(status)) return true;
+  if (status === 'LOGIN_REQUIRED') {
+    // Bot check → transient (IP-based), let yt-dlp try. Anything else → genuinely gated.
+    return !BOT_CHECK_PATTERN.test(reason);
+  }
+  return false;
+}
 
 /**
  * Parse Netscape cookie file format into a Cookie header string for youtubei.js.
@@ -275,6 +299,7 @@ export async function createStream(videoId, { exclude } = {}) {
   const clients = STREAM_CLIENTS.filter((c) => !excluded.has(c));
   const failures = [];
   let playability = null;
+  let playabilityReason = '';
 
   for (const client of clients) {
     let info;
@@ -289,8 +314,12 @@ export async function createStream(videoId, { exclude } = {}) {
 
     const status = info.playability_status?.status;
     if (status && status !== 'OK') {
-      playability = playability ?? status;
-      const reason = info.playability_status?.reason ? ` (${info.playability_status.reason})` : '';
+      const rawReason = info.playability_status?.reason ?? '';
+      if (!playability) {
+        playability = status;
+        playabilityReason = rawReason;
+      }
+      const reason = rawReason ? ` (${rawReason})` : '';
       failures.push(`${client}: ${status}${reason}`);
       console.log(`[youtube] ${client} not playable: ${status}${reason}`);
       continue;
@@ -337,12 +366,17 @@ export async function createStream(videoId, { exclude } = {}) {
     console.warn(`[youtube] could not stream ${videoId}: ${failures.join(' | ')}`);
   }
 
-  // A permanent playability failure means no extractor (yt-dlp included) will help.
-  if (playability && PERMANENT_FAILURES.has(playability)) {
+  // Only give up entirely when the video itself is unplayable. A bot-check LOGIN_REQUIRED is an
+  // IP-level block, so we return null and let the caller fall back to yt-dlp.
+  if (playability && isPermanentFailure(playability, playabilityReason)) {
     const error = new Error(PLAYABILITY_MESSAGES[playability] ?? `YouTube refused this video (${playability}).`);
     error.permanent = true;
     error.playability = playability;
     throw error;
+  }
+
+  if (playability === 'LOGIN_REQUIRED' && BOT_CHECK_PATTERN.test(playabilityReason)) {
+    console.warn('[youtube] bot check on this IP — falling back to yt-dlp');
   }
 
   return null;
