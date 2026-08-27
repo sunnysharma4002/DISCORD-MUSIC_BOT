@@ -64,17 +64,18 @@ async function getYouTube() {
   };
 
   const cookie = parseCookieString(process.env.YOUTUBE_COOKIE);
+  const poToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
+  const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || undefined;
 
-  // youtubei.js auto-generates visitor data and session on create().
-  // No need for manual YOUTUBE_PO_TOKEN or YOUTUBE_VISITOR_DATA.
-  // The library handles all the botguard challenges internally.
   ytInstance = await Innertube.create({
     cache: new UniversalCache(true, cacheDir),
     cookie,
+    po_token: poToken,
+    visitor_data: visitorData,
   });
 
   ytReady = true;
-  console.log('[youtube] InnerTube client ready (auto-generated session, no manual po_token needed)');
+  console.log(`[youtube] InnerTube client ready (poToken=${poToken ? 'yes' : 'no'} visitorData=${visitorData ? 'yes' : 'no'})`);
   return ytInstance;
 }
 
