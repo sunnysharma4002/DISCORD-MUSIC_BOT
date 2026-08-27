@@ -602,7 +602,7 @@ export class Player {
   /* Playback                                                          */
   /* ---------------------------------------------------------------- */
 
-  async _advance() {
+  async _advance(autoplaySeed = null) {
     if (this.destroyed || this._advancing) return;
     this._advancing = true;
 
@@ -624,15 +624,18 @@ export class Player {
       if (!next) {
         this.current = null;
 
-        // Autoplay: search for a related track when queue is empty
-        if (this.autoplay && finished) {
-          const related = await this._searchRelated(finished);
+        // Autoplay: search for a related track when queue is empty.
+        // `autoplaySeed` keeps the chain alive when the previous track failed to stream —
+        // in that case this.current was already cleared, so `finished` is null.
+        const seed = finished ?? autoplaySeed;
+        if (this.autoplay && seed) {
+          const related = await this._searchRelated(seed);
           if (related) {
             this.current = null;
             this.enqueue([related]);
             this._cancelIdleLeave();
             this._advancing = false;
-            await this._advance();
+            await this._advance(seed);
             return;
           }
         }
@@ -694,9 +697,10 @@ export class Player {
         `❌ Couldn't play **${track.title}** — ${this._friendlyError(err)}` +
         (this.queue.length ? ' Skipping to the next track.' : '')
       );
-      // Manually continue since no Idle event will fire
+      // Manually continue since no Idle event will fire. Pass the failed track as the
+      // autoplay seed so an unplayable pick doesn't silently end the autoplay chain.
       this.current = null;
-      await this._advance();
+      await this._advance(track);
     }
   }
 
@@ -782,7 +786,7 @@ export class Player {
         title: pick.title?.trim() || 'Unknown title',
         url: pick.url ?? `https://www.youtube.com/watch?v=${pick.id}`,
         videoId: pick.id,
-        duration: (Number(pick.duration) || 0) * 1000, // youtube-sr returns seconds
+        duration: Number(pick.duration) || 0, // youtube-sr returns milliseconds already
         isLive: Boolean(pick.live),
         thumbnail: pick.thumbnail?.url ?? `https://i.ytimg.com/vi/${pick.id}/hqdefault.jpg`,
         author: pick.channel?.name?.trim() || 'Unknown',
@@ -958,7 +962,7 @@ export class Player {
           title: video.title?.trim() ?? track.title,
           url: video.url ?? `https://www.youtube.com/watch?v=${video.id}`,
           videoId: video.id,
-          duration: (Number(video.duration) || 0) * 1000,
+          duration: Number(video.duration) || 0, // youtube-sr returns milliseconds already
           thumbnail: video.thumbnail?.url ?? track.thumbnail,
           author: video.channel?.name?.trim() ?? track.author,
           source: 'youtube',
