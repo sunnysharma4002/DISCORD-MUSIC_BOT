@@ -196,9 +196,21 @@ Relevant variables (all optional, see `.env`):
 |----------|---------|
 | `WARP_ENABLED` | Set false to force direct egress |
 | `WARP_PORT` | SOCKS5 bind port (default 8086) |
+| `WARP_ENDPOINT` | Pin a WARP endpoint as `ip:port` instead of random selection |
 | `WARP_GOOL` | Chain two WARP hops for a different exit region — try if plain WARP is also blocked |
 | `WARP_LICENSE_KEY` | WARP+ key, raises the bandwidth quota |
 | `YTDLP_PROXIES` | Extra proxies; full URLs (`socks5://…`, `http://user:pass@host:port`) or `host:port[:user:pass]` |
+
+Startup does two attempts: the default random endpoint, then `--scan`, which UDP-probes
+Cloudflare's ranges and keeps only responsive endpoints. The random pick can land on a dead or
+rate-limited endpoint, which is what `tunnel connectivity test failed` means.
+
+If WARP cannot start, the log names the cause:
+
+- `WireGuard handshake never completed` — the host blocks outbound UDP. WARP cannot work at
+  all there; use `YTDLP_PROXIES`.
+- `handshake succeeded but no traffic flowed` — dead or rate-limited endpoint. The scan retry
+  usually clears it; otherwise pin `WARP_ENDPOINT`.
 
 Everything degrades safely: no binary, a failed download, a failed handshake, or `warp=off`
 all just log a warning and fall back to the host IP. WARP is not guaranteed to work — its
@@ -269,7 +281,9 @@ package.json
 | `Required option "query" not found` / "You need to provide a song name or link" | Stale slash commands — set `GUILD_ID` in `.env`, run `npm run deploy`, then run `/deploy` in your server (or restart Discord) |
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
-| `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start. Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
+| `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start (the log names the cause). Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
+| `[warp] WireGuard handshake never completed` | Host blocks outbound UDP; WARP cannot work there. Use `YTDLP_PROXIES` |
+| `[warp] tunnel connectivity test failed` | Dead or rate-limited WARP endpoint. The automatic `--scan` retry usually fixes it; else pin `WARP_ENDPOINT=ip:port` |
 | YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. WARP or a proxy, not cookies |
 | `[cookies] PREFLIGHT FAILED` | Re-export `yt-cookies.txt`; the log states which of the four failure modes it is |
 | Spotify tracks not found | The embed scraper is rate-limited; wait a few seconds between requests |

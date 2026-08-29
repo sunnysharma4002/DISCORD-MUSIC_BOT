@@ -31,8 +31,15 @@ const CACHE_DIR = join(projectRoot, '.cache', 'warp');
 const HOST = '127.0.0.1';
 const DEFAULT_PORT = 8086;
 
-/** warp-plus registers with Cloudflare on first run; that can take a while on a cold cache. */
-const READY_TIMEOUT_MS = 60_000;
+/**
+ * Startup budget per attempt.
+ *
+ * warp-plus does its own bounded retrying and then exits: the WireGuard handshake gets 15s
+ * (app/wg.go waitHandshake), then a tunnel connectivity test gets 5s, twice
+ * (app/app.go runWarp), then the process calls os.Exit(1). So ~35s is the real ceiling and
+ * anything longer is just waiting on a corpse. We also watch for the exit directly.
+ */
+const READY_TIMEOUT_MS = 40_000;
 const READY_POLL_MS = 500;
 
 /** How long to wait for the exit-IP probe before giving up on it (non-fatal). */
@@ -187,10 +194,22 @@ async function probeExit(proxyPort) {
   });
 }
 
-/** Resolves once something accepts TCP on the bind port. */
-function waitForPort(p, deadline) {
+/**
+ * Resolves once something accepts TCP on the bind port, rejects if the process dies first.
+ *
+ * The bind port is a reliable readiness signal because warp-plus only calls net.Listen AFTER
+ * its tunnel connectivity test passes (wiresocks/proxy.go StartProxy, reached from
+ * app/app.go runWarp only once usermodeTunTest returns nil). While the test is failing,
+ * nothing is listening — so "port open" cannot be confused with "still retrying".
+ *
+ * @param {() => string|null} exitReason returns non-null once the child has exited
+ */
+function waitForPort(p, deadline, exitReason) {
   return new Promise((resolve, reject) => {
     const attempt = () => {
+      const dead = exitReason();
+      if (dead) return reject(new Error(`warp-plus exited before binding (${dead})`));
+
       if (Date.now() > deadline) {
         return reject(new Error(`warp-plus did not open ${HOST}:${p} within ${READY_TIMEOUT_MS}ms`));
       }
@@ -213,6 +232,11 @@ function waitForPort(p, deadline) {
 
 /**
  * Start warp-plus and wait until it is usable.
+ *
+ * Tries the default endpoint selection first, then falls back to `--scan`, which UDP-probes
+ * Cloudflare's WARP ranges and keeps only responsive endpoints. The default picks an endpoint
+ * IP/port at random from ~54 ports across several /24s, so a single dead or rate-limited pick
+ * fails the whole startup; scanning costs ~15s but survives that.
  *
  * Safe to call more than once; concurrent callers share one startup. Never throws — on any
  * failure it logs and returns null, and the rest of the bot carries on using the host IP.
@@ -240,83 +264,25 @@ export async function startWarp() {
   }
 
   _startPromise = (async () => {
-    const p = port();
-    const args = [
-      '--bind', `${HOST}:${p}`,
-      '--cache-dir', CACHE_DIR,
-      '-4', // IPv6 egress is unreliable on most container hosts
-    ];
-
-    // A WARP+ license raises the bandwidth quota. Optional; free WARP works without it.
-    const license = process.env.WARP_LICENSE_KEY?.trim();
-    if (license) args.push('--key', license);
-
-    // gool chains WARP through a second WARP hop, which changes the apparent exit region.
-    // Slower, but a different exit range — worth trying if the plain exit is blocked.
-    if (/^(1|true|yes|on)$/i.test(process.env.WARP_GOOL?.trim() ?? '')) args.push('--gool');
-
-    mkdirSync(CACHE_DIR, { recursive: true });
-
-    console.log(`[warp] starting warp-plus on ${HOST}:${p}...`);
-
-    _proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    // warp-plus is chatty; surface only what explains a failure.
-    const relay = (chunk) => {
-      for (const line of chunk.toString().split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        if (/error|fail|fatal|panic/i.test(t)) console.warn(`[warp] ${t.slice(0, 200)}`);
-      }
-    };
-    _proc.stdout.on('data', relay);
-    _proc.stderr.on('data', relay);
-
-    let exited = null;
-    _proc.on('exit', (code, signal) => {
-      exited = signal ? `signal ${signal}` : `code ${code}`;
-      // An exit after startup means the tunnel is gone; stop advertising the proxy so callers
-      // fall back to direct rather than dialling a dead port.
-      if (_proxyUrl) {
-        console.warn(`[warp] warp-plus exited (${exited}) — falling back to direct egress`);
-        _proxyUrl = null;
-        _exitInfo = null;
-      }
-      _proc = null;
-    });
-    _proc.on('error', (err) => {
-      console.warn(`[warp] failed to spawn: ${err.message}`);
-    });
-
     try {
-      await waitForPort(p, Date.now() + READY_TIMEOUT_MS);
-      if (exited) throw new Error(`warp-plus exited during startup (${exited})`);
+      // A pinned endpoint means the user knows which one works; don't second-guess it.
+      const pinned = process.env.WARP_ENDPOINT?.trim();
+      const attempts = pinned
+        ? [{ label: `endpoint ${pinned}`, extra: ['--endpoint', pinned] }]
+        : [
+            { label: 'default endpoint', extra: [] },
+            { label: 'endpoint scan', extra: ['--scan', '--rtt', '1s'] },
+          ];
 
-      const url = `socks5://${HOST}:${p}`;
-
-      // Confirm the tunnel actually carries traffic before declaring success.
-      try {
-        _exitInfo = await probeExit(p);
-        if (_exitInfo.warp === 'off') {
-          console.warn(`[warp] proxy is up but WARP is OFF (exit ip ${_exitInfo.ip ?? 'unknown'})`);
-          console.warn('[warp] traffic would leave via the host IP anyway — not using it');
-          stopWarp();
-          return null;
+      for (const attempt of attempts) {
+        const url = await tryStart(bin, attempt);
+        if (url) {
+          _proxyUrl = url;
+          return url;
         }
-        console.log(`[warp] ready: ${url} (exit ip ${_exitInfo.ip ?? 'unknown'}, warp=${_exitInfo.warp ?? 'unknown'})`);
-      } catch (err) {
-        // The probe is a nicety. A listening SOCKS port that failed one HTTP GET is still
-        // worth handing to yt-dlp, which will report its own errors.
-        console.warn(`[warp] exit-IP probe failed: ${err.message}`);
-        console.log(`[warp] ready: ${url} (unverified)`);
       }
 
-      _proxyUrl = url;
-      return _proxyUrl;
-    } catch (err) {
-      console.warn(`[warp] startup failed: ${err.message}`);
-      console.warn('[warp] continuing without WARP — yt-dlp will use the host IP');
-      stopWarp();
+      console.warn('[warp] all startup attempts failed — yt-dlp will use the host IP');
       return null;
     } finally {
       _startPromise = null;
@@ -324,6 +290,134 @@ export async function startWarp() {
   })();
 
   return _startPromise;
+}
+
+/**
+ * One warp-plus startup attempt. Returns the proxy URL, or null on failure.
+ * Cleans up the child process on every failure path so attempts don't stack up.
+ */
+async function tryStart(bin, { label, extra }) {
+  const p = port();
+  const args = [
+    '--bind', `${HOST}:${p}`,
+    '--cache-dir', CACHE_DIR,
+    '-4', // IPv6 egress is unreliable on most container hosts
+    ...extra,
+  ];
+
+  // A WARP+ license raises the bandwidth quota. Optional; free WARP works without it.
+  const license = process.env.WARP_LICENSE_KEY?.trim();
+  if (license) args.push('--key', license);
+
+  // gool chains WARP through a second WARP hop, which changes the apparent exit region.
+  // Slower, but a different exit range — worth trying if the plain exit is blocked.
+  if (/^(1|true|yes|on)$/i.test(process.env.WARP_GOOL?.trim() ?? '')) args.push('--gool');
+
+  mkdirSync(CACHE_DIR, { recursive: true });
+
+  console.log(`[warp] starting warp-plus on ${HOST}:${p} (${label})...`);
+
+  const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  _proc = proc;
+
+  /*
+   * Log relay.
+   *
+   * warp-plus retries its tunnel connectivity test in a tight loop with no backoff — an
+   * unreachable endpoint yields hundreds of identical `connection test failed` lines in the
+   * 5-second window, twice. Relaying those verbatim buried the actual startup in ~400 lines
+   * of noise. We count repeats instead and emit one summary, and we track which failure mode
+   * happened so the final message can name a cause.
+   */
+  const seen = new Map();
+  let sawHandshakeTimeout = false;
+  let sawTestFailure = false;
+
+  const relay = (chunk) => {
+    for (const line of chunk.toString().split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+
+      if (/connection test failed/i.test(t)) {
+        sawTestFailure = true;
+        seen.set('test', (seen.get('test') ?? 0) + 1);
+        continue;
+      }
+      if (/context deadline exceeded|waiting on handshake/i.test(t)) {
+        sawHandshakeTimeout = true;
+        seen.set('handshake', (seen.get('handshake') ?? 0) + 1);
+        continue;
+      }
+      // "failed to load identity" on a cold cache is normal — it registers immediately after.
+      if (/failed to load identity/i.test(t)) continue;
+
+      if (/error|fail|fatal|panic/i.test(t)) console.warn(`[warp] ${t.slice(0, 200)}`);
+    }
+  };
+  proc.stdout.on('data', relay);
+  proc.stderr.on('data', relay);
+
+  let exited = null;
+  proc.on('exit', (code, signal) => {
+    exited = signal ? `signal ${signal}` : `code ${code}`;
+    // An exit after startup means the tunnel is gone; stop advertising the proxy so callers
+    // fall back to direct rather than dialling a dead port.
+    if (_proxyUrl) {
+      console.warn(`[warp] warp-plus exited (${exited}) — falling back to direct egress`);
+      _proxyUrl = null;
+      _exitInfo = null;
+    }
+    if (_proc === proc) _proc = null;
+  });
+  proc.on('error', (err) => {
+    exited = `spawn error: ${err.message}`;
+    console.warn(`[warp] failed to spawn: ${err.message}`);
+  });
+
+  const summarise = () => {
+    const tests = seen.get('test') ?? 0;
+    const handshakes = seen.get('handshake') ?? 0;
+    if (tests) console.warn(`[warp] tunnel connectivity test failed (${tests} attempts)`);
+    if (handshakes) console.warn(`[warp] WireGuard handshake never completed (${handshakes} polls)`);
+
+    if (sawHandshakeTimeout && !sawTestFailure) {
+      console.warn('[warp] cause: no WireGuard handshake — outbound UDP is blocked by this host');
+      console.warn('[warp] a host that blocks outbound UDP cannot run WARP at all; use YTDLP_PROXIES instead');
+    } else if (sawTestFailure) {
+      console.warn('[warp] cause: handshake succeeded but no traffic flowed through the tunnel');
+      console.warn('[warp] usually a dead or rate-limited endpoint; pin a known-good one with WARP_ENDPOINT=ip:port');
+    }
+  };
+
+  try {
+    await waitForPort(p, Date.now() + READY_TIMEOUT_MS, () => exited);
+
+    const url = `socks5://${HOST}:${p}`;
+
+    // Confirm the tunnel actually carries traffic before declaring success.
+    try {
+      _exitInfo = await probeExit(p);
+      if (_exitInfo.warp === 'off') {
+        console.warn(`[warp] proxy is up but WARP is OFF (exit ip ${_exitInfo.ip ?? 'unknown'})`);
+        console.warn('[warp] traffic would leave via the host IP anyway — not using it');
+        killProc(proc);
+        return null;
+      }
+      console.log(`[warp] ready: ${url} (exit ip ${_exitInfo.ip ?? 'unknown'}, warp=${_exitInfo.warp ?? 'unknown'})`);
+    } catch (err) {
+      // The probe is a nicety. A listening SOCKS port that failed one HTTP GET is still
+      // worth handing to yt-dlp, which will report its own errors.
+      console.warn(`[warp] exit-IP probe failed: ${err.message}`);
+      console.log(`[warp] ready: ${url} (unverified)`);
+    }
+
+    return url;
+  } catch (err) {
+    console.warn(`[warp] ${label} failed: ${err.message}`);
+    summarise();
+    killProc(proc);
+    return null;
+  }
 }
 
 /** The WARP proxy URL if it is running, else null. Cheap; safe to call per request. */
@@ -336,19 +430,25 @@ export function getWarpExitInfo() {
   return _exitInfo;
 }
 
+/**
+ * SIGTERM then SIGKILL a warp-plus child. wireguard-go can sit in teardown, so don't let it
+ * outlive us — a stale process would hold the bind port and break the next attempt.
+ */
+function killProc(proc) {
+  if (!proc) return;
+  try { proc.kill('SIGTERM'); } catch {}
+  const t = setTimeout(() => {
+    try { proc.kill('SIGKILL'); } catch {}
+  }, 3000);
+  if (typeof t.unref === 'function') t.unref();
+}
+
 /** Terminate warp-plus. Idempotent. */
 export function stopWarp() {
   _proxyUrl = null;
   _exitInfo = null;
 
-  if (!_proc) return;
   const proc = _proc;
   _proc = null;
-
-  try { proc.kill('SIGTERM'); } catch {}
-  // wireguard-go can sit in teardown; don't let it outlive us.
-  const t = setTimeout(() => {
-    try { proc.kill('SIGKILL'); } catch {}
-  }, 3000);
-  if (typeof t.unref === 'function') t.unref();
+  killProc(proc);
 }
