@@ -53,12 +53,20 @@ const SESSION_REFRESH_MS = (() => {
 const CLIENTS_LOGGED_IN = ['MWEB', 'WEB_CREATOR'];
 const CLIENTS_ANONYMOUS = ['VISIONOS', 'IOS', 'ANDROID_VR', 'MWEB'];
 
-const CLIENTS_OVERRIDE = process.env.YOUTUBE_CLIENTS?.trim()
-  ? process.env.YOUTUBE_CLIENTS.split(',').map((s) => s.trim()).filter(Boolean)
-  : null;
+/**
+ * Validated YOUTUBE_CLIENTS override, or null.
+ *
+ * Resolved lazily and memoised: parseClientsOverride() reads consts declared further down, so
+ * evaluating it at module top level would hit a temporal dead zone.
+ */
+let _clientsOverride;
+function clientsOverride() {
+  if (_clientsOverride === undefined) _clientsOverride = parseClientsOverride();
+  return _clientsOverride;
+}
 
 /** Clients for the session we actually built; set by buildInnertube(). */
-let STREAM_CLIENTS = CLIENTS_OVERRIDE ?? CLIENTS_ANONYMOUS;
+let STREAM_CLIENTS = CLIENTS_ANONYMOUS;
 
 /**
  * Playability statuses that mean the video itself is unplayable — no extractor will help.
@@ -132,34 +140,43 @@ async function buildInnertube() {
   }
 
   // Client order depends on session type — the two working sets barely overlap.
-  STREAM_CLIENTS = CLIENTS_OVERRIDE ?? (useCookies ? CLIENTS_LOGGED_IN : CLIENTS_ANONYMOUS);
+  STREAM_CLIENTS = clientsOverride() ?? (useCookies ? CLIENTS_LOGGED_IN : CLIENTS_ANONYMOUS);
 
   // Explicit env values win, so a known-good pair can be pinned if ever needed.
   const envPoToken = process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
   const envVisitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || undefined;
 
   if (envPoToken && envVisitorData) {
-    const yt = await Innertube.create({
-      cache: new UniversalCache(true, cacheDir),
-      cookie,
-      po_token: envPoToken,
-      visitor_data: envVisitorData,
-    });
+    const yt = await withTimeout(
+      Innertube.create({
+        cache: new UniversalCache(true, cacheDir),
+        cookie,
+        po_token: envPoToken,
+        visitor_data: envVisitorData,
+      }),
+      'create the InnerTube session',
+    );
     console.log('[youtube] using pinned YOUTUBE_PO_TOKEN / YOUTUBE_VISITOR_DATA from env');
     return yt;
   }
 
   // Step 1 — a bare client just to get session visitor_data.
-  const seed = await Innertube.create({
-    cache: new UniversalCache(true, cacheDir),
-    cookie,
-    retrieve_player: false,
-  });
+  const seed = await withTimeout(
+    Innertube.create({
+      cache: new UniversalCache(true, cacheDir),
+      cookie,
+      retrieve_player: false,
+    }),
+    'open a seed InnerTube session',
+  );
 
   const visitorData = envVisitorData ?? seed.session.context.client.visitorData;
   if (!visitorData) {
     console.warn('[youtube] no visitor_data available; continuing without a PoToken');
-    return Innertube.create({ cache: new UniversalCache(true, cacheDir), cookie });
+    return withTimeout(
+      Innertube.create({ cache: new UniversalCache(true, cacheDir), cookie }),
+      'create the InnerTube session',
+    );
   }
 
   // Step 2 — mint a PoToken bound to the identifier this session type requires.
@@ -178,12 +195,127 @@ async function buildInnertube() {
   }
 
   // Step 3 — the real client.
-  return Innertube.create({
-    cache: new UniversalCache(true, cacheDir),
-    cookie,
-    po_token: poToken,
-    visitor_data: visitorData,
+  return withTimeout(
+    Innertube.create({
+      cache: new UniversalCache(true, cacheDir),
+      cookie,
+      po_token: poToken,
+      visitor_data: visitorData,
+    }),
+    'create the InnerTube session',
+  );
+}
+
+/**
+ * How long any single InnerTube call may take before it is abandoned.
+ *
+ * Without this a hung request stalls playback indefinitely: the client-fallback loop in
+ * createStream() awaits each getBasicInfo/download in turn, so one socket that never answers
+ * blocks every remaining client and the track never starts. A timeout turns that into a
+ * normal per-client failure and the loop moves on. Override with YOUTUBE_REQUEST_TIMEOUT_MS.
+ */
+const REQUEST_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.YOUTUBE_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 20_000;
+})();
+
+/**
+ * Reject if `promise` has not settled within `ms`.
+ *
+ * The underlying request is not cancelled — youtubei.js gives us no handle to abort — but the
+ * caller stops waiting, which is what matters. The timer is always cleared so a slow-but-
+ * successful call does not keep the event loop alive.
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {string} what described in the error message
+ * @param {number} [ms]
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, what, ms = REQUEST_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms trying to ${what}`)), ms);
   });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Every InnerTube client youtubei.js accepts. Anything else is a typo and would be sent to
+ * YouTube verbatim, producing a confusing failure rather than a clear config error.
+ */
+const VALID_CLIENTS = new Set([
+  'VISIONOS', 'IOS', 'ANDROID_VR', 'MWEB', 'WEB', 'WEB_CREATOR',
+  'ANDROID', 'TV_EMBEDDED', 'WEB_EMBEDDED', 'YTMUSIC', 'YTMUSIC_ANDROID',
+  'TV', 'WEB_KIDS', 'ANDROID_MUSIC', 'IOS_MUSIC',
+]);
+
+/**
+ * Clients that answer metadata but cannot deliver a full audio stream from this codebase's
+ * request pattern. Measured (see the table above): they serve small ranges then 403 on any
+ * chunk over ~100KB, and youtubei.js fetches in 10MB chunks.
+ *
+ * Keeping them in the list is not harmful — they are useful as a last-resort metadata source —
+ * but putting them FIRST is, because every track pays their round-trip and failure before
+ * reaching a client that works.
+ */
+const NON_STREAMING_CLIENTS = new Set(['MWEB', 'WEB', 'WEB_CREATOR', 'TV_EMBEDDED', 'WEB_EMBEDDED']);
+
+/**
+ * Parse and validate YOUTUBE_CLIENTS.
+ *
+ * Unknown names are dropped with a warning. When the override leads with clients that cannot
+ * stream, say so loudly and name the ones that can — a 9-client override starting with
+ * MWEB/WEB/WEB_CREATOR looks thorough but spends several seconds per track failing before it
+ * reaches VISIONOS/IOS/ANDROID_VR.
+ *
+ * @returns {string[] | null} null when unset or nothing valid remains
+ */
+function parseClientsOverride() {
+  const raw = process.env.YOUTUBE_CLIENTS?.trim();
+  if (!raw) return null;
+
+  const requested = raw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+  const valid = [];
+  const unknown = [];
+
+  for (const name of requested) {
+    if (VALID_CLIENTS.has(name)) {
+      if (!valid.includes(name)) valid.push(name);
+    } else {
+      unknown.push(name);
+    }
+  }
+
+  if (unknown.length) {
+    console.warn(`[youtube] YOUTUBE_CLIENTS contains unknown client(s): ${unknown.join(', ')} — ignoring them`);
+    console.warn(`[youtube] valid clients: ${[...VALID_CLIENTS].join(', ')}`);
+  }
+
+  if (!valid.length) {
+    console.warn('[youtube] YOUTUBE_CLIENTS had no usable clients — falling back to the built-in order');
+    return null;
+  }
+
+  // How many leading entries cannot actually stream?
+  let deadLead = 0;
+  while (deadLead < valid.length && NON_STREAMING_CLIENTS.has(valid[deadLead])) deadLead++;
+
+  if (deadLead > 0) {
+    const dead = valid.slice(0, deadLead);
+    const working = valid.filter((c) => !NON_STREAMING_CLIENTS.has(c));
+
+    console.warn(`[youtube] YOUTUBE_CLIENTS starts with ${dead.join(', ')} — these return metadata but 403 on real audio chunks`);
+    console.warn(`[youtube] every track will waste a round-trip on each before reaching a client that streams`);
+    if (working.length) {
+      console.warn(`[youtube] put these first instead: ${working.join(',')}`);
+    } else {
+      console.warn(`[youtube] NONE of the listed clients can stream — recommended: ${CLIENTS_ANONYMOUS.join(',')}`);
+    }
+    console.warn('[youtube] unset YOUTUBE_CLIENTS to use the built-in order');
+  }
+
+  return valid;
 }
 
 /**
@@ -324,7 +456,7 @@ export async function search(query, limit = 5) {
   const yt = await getYouTube();
 
   try {
-    const results = await yt.search(query, { type: 'video' });
+    const results = await withTimeout(yt.search(query, { type: 'video' }), 'search YouTube');
     const items = results.videos || results.results || [];
     const videos = [];
 
@@ -363,7 +495,7 @@ export async function getVideoInfo(videoId) {
 
   for (const client of STREAM_CLIENTS) {
     try {
-      const info = await yt.getBasicInfo(videoId, { client });
+      const info = await withTimeout(yt.getBasicInfo(videoId, { client }), `load video info via ${client}`);
       const basic = info.basic_info ?? {};
       if (!basic.title) continue;
 
@@ -395,7 +527,7 @@ export async function getStreamUrl(videoId) {
 
   for (const client of STREAM_CLIENTS) {
     try {
-      const info = await yt.getBasicInfo(videoId, { client });
+      const info = await withTimeout(yt.getBasicInfo(videoId, { client }), `load stream info via ${client}`);
 
       const status = info.playability_status?.status;
       if (status && status !== 'OK') {
@@ -541,7 +673,7 @@ export async function createStream(videoId, { exclude, _retried = false } = {}) 
   for (const client of clients) {
     let info;
     try {
-      info = await yt.getBasicInfo(videoId, { client });
+      info = await withTimeout(yt.getBasicInfo(videoId, { client }), `load stream info via ${client}`);
     } catch (err) {
       const detail = describeStreamError(err);
       failures.push(`${client}: ${detail}`);
@@ -581,7 +713,10 @@ export async function createStream(videoId, { exclude, _retried = false } = {}) 
 
     let webStream;
     try {
-      webStream = await info.download({ itag: format.itag, type: 'audio' });
+      webStream = await withTimeout(
+        info.download({ itag: format.itag, type: 'audio' }),
+        `start the ${client} stream`,
+      );
     } catch (err) {
       const detail = describeStreamError(err);
       failures.push(`${client}: ${detail}`);
@@ -598,7 +733,7 @@ export async function createStream(videoId, { exclude, _retried = false } = {}) 
     // the player just sees a stream that ended early and advances to the next song.
     let probeStream;
     try {
-      probeStream = await probeReadable(webStream);
+      probeStream = await withTimeout(probeReadable(webStream), `read the first ${client} chunk`);
     } catch (err) {
       const detail = describeStreamError(err);
       failures.push(`${client}: ${detail}`);
@@ -656,7 +791,7 @@ export async function getPlaylist(playlistId, limit = 60) {
   const yt = await getYouTube();
 
   try {
-    const playlist = await yt.getPlaylist(playlistId);
+    const playlist = await withTimeout(yt.getPlaylist(playlistId), 'load the playlist');
     const items = playlist.items || [];
     const videos = [];
 
@@ -677,7 +812,7 @@ export async function getPlaylist(playlistId, limit = 60) {
     // Paginate if needed
     let page = playlist;
     while (videos.length < limit && page.has_continuation) {
-      page = await page.getContinuation();
+      page = await withTimeout(page.getContinuation(), 'load more of the playlist');
       for (const item of page.items || []) {
         const id = item.id || item.video_id;
         if (!id) continue;
@@ -706,3 +841,7 @@ export async function getPlaylist(playlistId, limit = 60) {
 }
 
 export { getYouTube };
+
+/* Test-only exports. Not part of the module's contract; used by the verification scripts to
+ * exercise the timeout wrapper and client-list validation without building a live session. */
+export { withTimeout as __testWithTimeout, parseClientsOverride as __testParseClients };

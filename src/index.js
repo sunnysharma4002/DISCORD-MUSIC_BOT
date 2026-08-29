@@ -10,7 +10,6 @@ import { generateDependencyReport, AudioPlayerStatus } from '@discordjs/voice';
 import { Player } from './voice/Player.js';
 import { registerCommands } from './commands/handler.js';
 import { reportCookieStatus } from './utils/cookies.js';
-import { startWarp, stopWarp } from './utils/warp.js';
 import dotenv from 'dotenv';
 import { writeFileSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -73,12 +72,6 @@ if (!cookiesOk && /^(1|true|yes)$/i.test(process.env.YOUTUBE_REQUIRE_COOKIES?.tr
   releaseLock();
   process.exit(1);
 }
-
-/* WARP egress ---------------------------------------------------------- */
-// Cloudflare WARP gives yt-dlp a non-datacenter-looking exit IP, which is what YouTube's
-// "confirm you're not a bot" check actually keys on. Started before login so the first /play
-// already has it; never fatal — a null result just means yt-dlp uses the host IP.
-await startWarp();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -355,7 +348,6 @@ client.on('warn', (msg) => console.warn('[CLIENT WARN]', msg));
 client.on('invalidated', () => {
   console.error('[FATAL] Gateway session invalidated — another instance logged in with this token.');
   console.error('        Shutting down to avoid duplicate command handling.');
-  stopWarp();
   releaseLock();
   process.exit(0);
 });
@@ -375,7 +367,6 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
       try { player.destroy(); } catch {}
     }
     client.destroy();
-    stopWarp();
     releaseLock();
     process.exit(0);
   });

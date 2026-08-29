@@ -1,4 +1,4 @@
-# Discord Music Bot
+﻿# Discord Music Bot
 
 A modular Discord music bot built with Discord.js v14, supporting YouTube, Spotify, and SoundCloud sources.
 
@@ -161,69 +161,56 @@ server-side (YouTube cleared them — the file still looks valid). Set
 `YOUTUBE_REQUIRE_COOKIES=true` to refuse to start instead of degrading to anonymous.
 
 Cookies on a datacenter IP get revoked within days. If that keeps happening, the fix is
-egress, not cookies — see the WARP section below.
+egress, not cookies — see the section below.
 
-### 11. Cloudflare WARP (bypasses YouTube IP blocks)
+### 11. YouTube IP blocks
 
 YouTube's `Sign in to confirm you're not a bot` is triggered by the *source IP*, not by
 missing cookies. A valid signed-in jar plus a fresh PoToken will still be refused from a
-hosting provider's address range. The fix is to leave from somewhere else.
+hosting provider's address range, and the same block is why exported cookies keep getting
+revoked server-side. The only real fix is to leave from a different address.
 
-WARP exit IPs are shared with the consumer 1.1.1.1 app's users, so they are datacenter-owned
-but carry ordinary consumer traffic — YouTube can't blanket-block them without breaking real
-users. This is free and needs no account.
+Set `YTDLP_PROXIES` to route yt-dlp through one:
 
-Setup is automatic on Linux: `postinstall` runs `scripts/setup-warp.mjs`, which downloads the
-pinned `warp-plus` build (checksum-verified) to `vendor/warp-plus`. On startup the bot spawns
-it as a local SOCKS5 proxy, verifies the tunnel against Cloudflare's trace endpoint, and
-routes every yt-dlp invocation through it:
-
-```
-[warp] starting warp-plus on 127.0.0.1:8086...
-[warp] ready: socks5://127.0.0.1:8086 (exit ip 104.28.x.x, warp=on)
+```env
+# full URL, or shorthand host:port / host:port:user:pass (assumed http)
+YTDLP_PROXIES=socks5://user:pass@host:1080
+YTDLP_PROXIES=http://user:pass@host:8080,1.2.3.4:8080
 ```
 
-`warp-plus` is used rather than the official client because the official one needs a TUN
-device and `CAP_NET_ADMIN`, which managed container hosts don't grant. `warp-plus` is a
-userspace WireGuard implementation exposing a plain SOCKS port, so it needs no privileges.
+Attempts are ordered proxies → direct. Direct is last because it is the address being
+blocked; trying every extractor strategy from it first only wastes ~20 seconds.
 
-Attempts are ordered WARP → `YTDLP_PROXIES` → direct. Direct is last because it is the address
-being blocked; trying six extractor strategies from it first only wastes ~20 seconds.
+Residential proxies work. Datacenter proxies are usually blocked just like the host IP, so a
+cheap datacenter proxy will not help. Cloudflare WARP was tried and does not work on managed
+container hosts — its registration API rejects them and WireGuard traffic tends to be filtered.
 
-Relevant variables (all optional, see `.env`):
+### 12. InnerTube clients
 
-| Variable | Purpose |
-|----------|---------|
-| `WARP_ENABLED` | Set false to force direct egress |
-| `WARP_PORT` | SOCKS5 bind port (default 8086) |
-| `WARP_ENDPOINT` | Pin a WARP endpoint as `ip:port` instead of random selection |
-| `WARP_GOOL` | Chain two WARP hops for a different exit region — try if plain WARP is also blocked |
-| `WARP_LICENSE_KEY` | WARP+ key, raises the bandwidth quota |
-| `YTDLP_PROXIES` | Extra proxies; full URLs (`socks5://…`, `http://user:pass@host:port`) or `host:port[:user:pass]` |
+YouTube serves audio through per-client APIs, and which ones actually deliver bytes varies by
+client, video and server IP. The bot tries them in order and falls through on any failure, so
+ordering is the single biggest factor in how fast a track starts.
 
-Startup walks an attempt ladder, stopping at the first one that works:
+Measured from this codebase's request pattern (youtubei.js fetches in 10MB chunks):
 
-1. **default endpoint** — random pick from Cloudflare's WARP ranges
-2. **`--scan`** — UDP-probes the ranges and uses only responsive endpoints
-3. **`--gool`** — tunnels WARP inside WARP, changing both the handshake target and exit region
+| Client | Anonymous session | Signed-in session |
+|--------|-------------------|-------------------|
+| `VISIONOS`, `IOS`, `ANDROID_VR` | full track | HTTP 400 (rejects session cookies) |
+| `MWEB`, `WEB_CREATOR` | 403 above ~100KB | 403 above ~100KB |
 
-Setting `WARP_ENDPOINT` skips the ladder and uses only that endpoint.
+So `MWEB`, `WEB`, `WEB_CREATOR`, `TV_EMBEDDED` and `WEB_EMBEDDED` are metadata-only in
+practice. They stay last as a fallback; putting them first makes every track pay a failed
+round-trip each before reaching one that works.
 
-If WARP cannot start, the log names which of three unrelated things went wrong:
+Defaults (no configuration needed): `VISIONOS,IOS,ANDROID_VR,MWEB` anonymous,
+`MWEB,WEB_CREATOR` signed-in.
 
-- `Cloudflare refused to issue a WARP identity (API 400)` — registration, not networking. The
-  tunnel was never attempted. Usually this IP is rate-limited by the WARP registration API. The
-  bot purges `.cache/warp` and retries once, then stops (the other ladder rungs would fail
-  identically).
-- `WireGuard handshake never completed` — the host blocks outbound UDP. WARP cannot work at
-  all there; use `YTDLP_PROXIES`.
-- `handshake completed but no traffic flowed` — the endpoint answers UDP but drops tunnelled
-  packets (dead, rate-limited, or MTU-filtered). The ladder tries to route around this; if all
-  three rungs fail, this host cannot reach WARP.
+`YOUTUBE_CLIENTS` overrides the order. Unknown names are dropped with a warning, and if the
+override leads with non-streaming clients the bot says so at startup and names a better order.
+Leave it unset unless you have a specific reason.
 
-Everything degrades safely: no binary, a failed download, a failed handshake, or `warp=off`
-all just log a warning and fall back to the host IP. WARP is not guaranteed to work — its
-ranges do get rate-limited — but it costs nothing to try before paying for residential proxies.
+`YOUTUBE_REQUEST_TIMEOUT_MS` (default 20000) bounds every InnerTube call. Without it one hung
+socket blocks the whole fallback loop and the track never starts.
 
 ## Audio Pipeline
 
@@ -244,7 +231,7 @@ User runs /play <query>
                                        ▼
                             Player.playTrack(track)
                                        │
-                    ┌──────────────────┴──────────────────┐
+                    ┌──────────────────┴──────────────────â”
                     │                                     │
               YouTube stream                        Spotify-resolved
               via @distube/ytdl-core                (same — YouTube URL)
@@ -290,12 +277,12 @@ package.json
 | `Required option "query" not found` / "You need to provide a song name or link" | Stale slash commands — set `GUILD_ID` in `.env`, run `npm run deploy`, then run `/deploy` in your server (or restart Discord) |
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
-| `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start (the log names the cause). Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
-| `[warp] Cloudflare refused to issue a WARP identity` | WARP registration API rejected this IP (rate limit). Not fixable locally; use `YTDLP_PROXIES` |
-| `[warp] WireGuard handshake never completed` | Host blocks outbound UDP; WARP cannot work there. Use `YTDLP_PROXIES` |
-| `[warp] tunnel connectivity test failed` | The WARP endpoint answers UDP but drops tunnelled traffic. The ladder retries with `--scan` then `--gool`; if all fail, this host cannot reach WARP — use `YTDLP_PROXIES` |
-| YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. WARP or a proxy, not cookies |
+| `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Set `YTDLP_PROXIES` to a residential proxy |
+| YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. A proxy, not cookies |
 | `[cookies] PREFLIGHT FAILED` | Re-export `yt-cookies.txt`; the log states which of the four failure modes it is |
+| `[youtube] YOUTUBE_CLIENTS starts with ...` | The override leads with clients that can't stream. Unset `YOUTUBE_CLIENTS`, or reorder as the warning suggests |
+| `[youtube] timed out after ...ms` | An InnerTube request hung; the bot moved to the next client. Raise `YOUTUBE_REQUEST_TIMEOUT_MS` if your host is just slow |
+| Tracks take many seconds to start | Usually a bad `YOUTUBE_CLIENTS` order — each dead client costs a round-trip before a working one is reached |
 | Spotify tracks not found | The embed scraper is rate-limited; wait a few seconds between requests |
 | Bot leaves immediately | Check `Connect`/`Speak` permissions in the voice channel |
 | No audio (bot joins but silent) | Run the bot once and check the `@discordjs/voice` dependency report at startup — `opusscript` and `libsodium-wrappers` must be present |
