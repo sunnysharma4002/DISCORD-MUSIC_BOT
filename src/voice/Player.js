@@ -36,6 +36,7 @@ import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
 import { createStream } from '../utils/youtube.js';
 import { getCookieFilePath } from '../utils/cookies.js';
+import { getWarpProxy } from '../utils/warp.js';
 
 /** Extract video ID from URL. */
 function extractVideoId(url) {
@@ -112,6 +113,21 @@ function resolveCookieFile() {
 function cookieArgs() {
   const cookies = resolveCookieFile();
   return cookies ? ['--cookies', cookies] : [];
+}
+
+/**
+ * Proxy args for yt-dlp, preferring the WARP tunnel when it is up.
+ *
+ * MUST be included in every yt-dlp invocation. Missing it on the metadata calls was the
+ * reason `-J` still failed with a bot check while the stream attempts were being proxied:
+ * a single unproxied request from the host IP is enough for YouTube to answer LOGIN_REQUIRED,
+ * and _enrichMetadata / _testYouTubeExtraction both went out direct.
+ *
+ * @param {string|null} [override] use this proxy instead of WARP (for per-attempt proxies)
+ */
+function proxyArgs(override) {
+  const proxy = override ?? getWarpProxy();
+  return proxy ? ['--proxy', proxy] : [];
 }
 
 /** yt-dlp args for mobile client spoofing + optional cookies. */
@@ -268,6 +284,7 @@ export class Player {
       '-J',
       '--no-playlist',
       '--no-warnings',
+      ...proxyArgs(),
       '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
       '--extractor-retries', '3',
       testUrl,
@@ -1115,26 +1132,39 @@ export class Player {
       },
     ];
 
-    // Build all combinations: strategies × (direct + each proxy)
+    /* Egress selection ------------------------------------------------- *
+     *
+     * WARP goes FIRST, not last. The host IP is the thing YouTube is blocking, so trying six
+     * client strategies from it before switching egress just spends ~20s proving the block is
+     * still there. Order: WARP → user proxies → direct (as a last resort, since it does work
+     * for unrestricted videos and costs nothing when WARP is down).
+     *
+     * All strategies are tried on the primary egress; secondary egresses get only the default
+     * strategy, to keep the worst case bounded rather than 6 × N attempts.
+     */
+    const warp = getWarpProxy();
+    const egresses = [];
+
+    if (warp) egresses.push({ proxy: warp, tag: 'warp' });
+    for (const p of proxies) egresses.push({ proxy: p, tag: `proxy:${p.replace(/\/\/[^@]*@/, '//***@').slice(0, 40)}` });
+    egresses.push({ proxy: null, tag: 'direct' });
+
     const allAttempts = [];
+    const [primary, ...secondaries] = egresses;
 
-    // Direct attempts (no proxy)
     for (const strategy of strategies) {
-      allAttempts.push({ ...strategy, proxy: null, label: strategy.name });
+      allAttempts.push({ ...strategy, proxy: primary.proxy, label: `${primary.tag}/${strategy.name}` });
     }
-
-    // Proxy attempts (each proxy with the best strategy)
-    for (const proxy of proxies) {
+    for (const egress of secondaries) {
       allAttempts.push({
-        name: 'android+ios+tv',
-        args: [...antiBotArgs()],
-        proxy,
-        label: `proxy:${proxy.substring(0, 40)}...`,
+        ...strategies[0],
+        proxy: egress.proxy,
+        label: `${egress.tag}/${strategies[0].name}`,
       });
     }
 
-    for (const attempt of allAttempts) {
-      const proxyArgs = attempt.proxy ? ['--proxy', attempt.proxy] : [];
+    for (let i = 0; i < allAttempts.length; i++) {
+      const attempt = allAttempts[i];
       console.log(`[player] yt-dlp attempt: ${attempt.label}`);
 
       const args = [
@@ -1143,7 +1173,7 @@ export class Player {
         '--quiet',
         '--no-warnings',
         '-o', '-',
-        ...proxyArgs,
+        ...proxyArgs(attempt.proxy),
         ...attempt.args,
         url,
       ];
@@ -1155,19 +1185,28 @@ export class Player {
         return result;
       }
 
-      // Longer delay between attempts to avoid rate limiting
-      await new Promise(r => setTimeout(r, 2000));
+      // Back off between attempts to avoid rate limiting — but not after the last one.
+      if (i < allAttempts.length - 1) await new Promise((r) => setTimeout(r, 2000));
     }
 
-    const methods = ['Innertube API', 'play-dl', 'yt-dlp'];
-    throw new Error(`All streaming methods failed (tried: ${methods.join(', ')}). YouTube is blocking this server IP. Use a residential proxy (YTDLP_PROXIES) or switch hosting.`);
+    const egressList = egresses.map((e) => e.tag).join(', ');
+    const advice = warp
+      ? 'WARP is running but YouTube still refused. Try WARP_GOOL=true for a different exit region, or add residential proxies via YTDLP_PROXIES.'
+      : 'WARP is not running — enable it (vendor/warp-plus) or add residential proxies via YTDLP_PROXIES.';
+    throw new Error(
+      `All streaming methods failed (Innertube API, yt-dlp; egress tried: ${egressList}). ${advice}`,
+    );
   }
 
   /** Try spawning yt-dlp and return the AudioResource, or null on failure. */
   async _trySpawnStream(bin, pre, track, url, args) {
     return new Promise((resolve) => {
-      console.log(`[player] spawning: ${bin} ${args.slice(0, 3).join(' ')}...`);
-      const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      // `pre` carries the leading args from a YTDLP_CMD override such as "python -m yt_dlp".
+      // It was previously dropped here, so that form of override lost its arguments and the
+      // spawn failed with an unhelpful error.
+      const argv = [...pre, ...args];
+      console.log(`[player] spawning: ${bin} ${argv.slice(0, 3).join(' ')}...`);
+      const proc = spawn(bin, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
 
       let stderr = '';
       let startTime = Date.now();
@@ -1282,7 +1321,7 @@ export class Player {
     const info = await new Promise((resolve, reject) => {
       const proc = spawn(
         bin,
-        [...pre, '-J', '--no-playlist', '--no-warnings', ...antiBotArgs(), url],
+        [...pre, '-J', '--no-playlist', '--no-warnings', ...proxyArgs(), ...antiBotArgs(), url],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       let out = '';
@@ -1334,7 +1373,9 @@ export class Player {
     if (/unavailable/i.test(msg)) return 'the video is unavailable in this region.';
     if (/age.?restrict|confirm your age/i.test(msg)) return 'the video is age-restricted.';
     if (/confirm.*not a bot|sign in to confirm/i.test(msg)) {
-      return 'YouTube blocked this server (bot check). Refresh yt-cookies.txt or set YTDLP_PROXIES.';
+      return getWarpProxy()
+        ? 'YouTube blocked this server even through WARP. Try WARP_GOOL=true or add residential proxies (YTDLP_PROXIES).'
+        : 'YouTube blocked this server (bot check). Enable the WARP proxy or set YTDLP_PROXIES.';
     }
     if (/429|rate/i.test(msg)) return 'YouTube is rate-limiting. Add YTDLP_PROXIES with residential proxies.';
     if (/no.*format|playable/i.test(msg)) return 'no playable audio stream found.';
@@ -1346,26 +1387,40 @@ export class Player {
     return msg.slice(0, 150) || 'unknown streaming error.';
   }
 
-  /** Parse proxies from YTDLP_PROXIES env var (comma-separated list). */
+  /**
+   * Proxies from YTDLP_PROXIES (comma-separated).
+   *
+   * Two accepted forms:
+   *   - a full URL:  socks5://user:pass@host:1080, http://host:8080
+   *   - shorthand:   host:port  or  host:port:user:pass  (assumed http)
+   *
+   * The URL form matters: the old parser split unconditionally on ':', so a SOCKS URL came
+   * apart into ["socks5", "//host", "port"] and was reassembled as
+   * "http://socks5://host" — a nonsense proxy that yt-dlp rejects. Any value containing
+   * "://" is now passed through untouched.
+   */
   _getProxies() {
     const proxiesStr = (process.env.YTDLP_PROXIES || '').trim();
     if (!proxiesStr) return [];
 
     const proxies = [];
-    const parts = proxiesStr.split(',').map(s => s.trim()).filter(Boolean);
 
-    for (const part of parts) {
+    for (const part of proxiesStr.split(',').map((s) => s.trim()).filter(Boolean)) {
+      // Already a URL — the user picked the scheme, respect it.
+      if (part.includes('://')) {
+        proxies.push(part);
+        continue;
+      }
+
       const segments = part.split(':');
-      if (segments.length >= 2) {
-        let proxy;
-        if (segments.length >= 4) {
-          const [host, port, user, pass] = segments;
-          proxy = `http://${user}:${pass}@${host}:${port}`;
-        } else {
-          const [host, port] = segments;
-          proxy = `http://${host}:${port}`;
-        }
-        proxies.push(proxy);
+      if (segments.length >= 4) {
+        const [host, port, user, pass] = segments;
+        proxies.push(`http://${user}:${pass}@${host}:${port}`);
+      } else if (segments.length >= 2) {
+        const [host, port] = segments;
+        proxies.push(`http://${host}:${port}`);
+      } else {
+        console.warn(`[player] ignoring unparseable proxy "${part}" — use a full URL or host:port`);
       }
     }
 

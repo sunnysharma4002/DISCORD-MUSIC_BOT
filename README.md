@@ -160,8 +160,49 @@ The bot checks the jar at startup and prints one of four verdicts: `missing`, `i
 server-side (YouTube cleared them — the file still looks valid). Set
 `YOUTUBE_REQUIRE_COOKIES=true` to refuse to start instead of degrading to anonymous.
 
-Cookies on a datacenter IP get revoked within days. If that keeps happening, add residential
-proxies via `YTDLP_PROXIES`.
+Cookies on a datacenter IP get revoked within days. If that keeps happening, the fix is
+egress, not cookies — see the WARP section below.
+
+### 11. Cloudflare WARP (bypasses YouTube IP blocks)
+
+YouTube's `Sign in to confirm you're not a bot` is triggered by the *source IP*, not by
+missing cookies. A valid signed-in jar plus a fresh PoToken will still be refused from a
+hosting provider's address range. The fix is to leave from somewhere else.
+
+WARP exit IPs are shared with the consumer 1.1.1.1 app's users, so they are datacenter-owned
+but carry ordinary consumer traffic — YouTube can't blanket-block them without breaking real
+users. This is free and needs no account.
+
+Setup is automatic on Linux: `postinstall` runs `scripts/setup-warp.mjs`, which downloads the
+pinned `warp-plus` build (checksum-verified) to `vendor/warp-plus`. On startup the bot spawns
+it as a local SOCKS5 proxy, verifies the tunnel against Cloudflare's trace endpoint, and
+routes every yt-dlp invocation through it:
+
+```
+[warp] starting warp-plus on 127.0.0.1:8086...
+[warp] ready: socks5://127.0.0.1:8086 (exit ip 104.28.x.x, warp=on)
+```
+
+`warp-plus` is used rather than the official client because the official one needs a TUN
+device and `CAP_NET_ADMIN`, which managed container hosts don't grant. `warp-plus` is a
+userspace WireGuard implementation exposing a plain SOCKS port, so it needs no privileges.
+
+Attempts are ordered WARP → `YTDLP_PROXIES` → direct. Direct is last because it is the address
+being blocked; trying six extractor strategies from it first only wastes ~20 seconds.
+
+Relevant variables (all optional, see `.env`):
+
+| Variable | Purpose |
+|----------|---------|
+| `WARP_ENABLED` | Set false to force direct egress |
+| `WARP_PORT` | SOCKS5 bind port (default 8086) |
+| `WARP_GOOL` | Chain two WARP hops for a different exit region — try if plain WARP is also blocked |
+| `WARP_LICENSE_KEY` | WARP+ key, raises the bandwidth quota |
+| `YTDLP_PROXIES` | Extra proxies; full URLs (`socks5://…`, `http://user:pass@host:port`) or `host:port[:user:pass]` |
+
+Everything degrades safely: no binary, a failed download, a failed handshake, or `warp=off`
+all just log a warning and fall back to the host IP. WARP is not guaranteed to work — its
+ranges do get rate-limited — but it costs nothing to try before paying for residential proxies.
 
 ## Audio Pipeline
 
@@ -228,7 +269,9 @@ package.json
 | `Required option "query" not found` / "You need to provide a song name or link" | Stale slash commands — set `GUILD_ID` in `.env`, run `npm run deploy`, then run `/deploy` in your server (or restart Discord) |
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
-| YouTube rate limit (HTTP 429) | Add a `YOUTUBE_COOKIE` to `.env` |
+| `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start. Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
+| YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. WARP or a proxy, not cookies |
+| `[cookies] PREFLIGHT FAILED` | Re-export `yt-cookies.txt`; the log states which of the four failure modes it is |
 | Spotify tracks not found | The embed scraper is rate-limited; wait a few seconds between requests |
 | Bot leaves immediately | Check `Connect`/`Speak` permissions in the voice channel |
 | No audio (bot joins but silent) | Run the bot once and check the `@discordjs/voice` dependency report at startup — `opusscript` and `libsodium-wrappers` must be present |
