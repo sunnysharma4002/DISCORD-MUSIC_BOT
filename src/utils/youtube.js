@@ -229,6 +229,28 @@ async function getYouTube() {
 }
 
 /**
+ * The current session's PoToken and visitor_data, or nulls when unavailable.
+ *
+ * Exposed so yt-dlp can reuse them. yt-dlp cannot mint its own PoToken — it asks the user to
+ * supply one via `--extractor-args "youtube:po_token=CLIENT.gvs+TOKEN"` and otherwise SKIPS
+ * every format that needs one, which surfaces as "Requested format is not available". Since
+ * this process already mints a token every 3 hours for InnerTube, handing the same one to
+ * yt-dlp costs nothing.
+ *
+ * Not async on purpose: called while building yt-dlp argv, which must not block. Returns
+ * nulls before the first session is built.
+ *
+ * @returns {{ poToken: string | null, visitorData: string | null }}
+ */
+export function getSessionTokens() {
+  const session = ytInstance?.session;
+  return {
+    poToken: session?.po_token ?? null,
+    visitorData: session?.context?.client?.visitorData ?? null,
+  };
+}
+
+/**
  * Rebuild the session in place with a freshly minted PoToken.
  *
  * Safe to call mid-playback: already-open streams hold their own deciphered URLs and keep

@@ -34,7 +34,7 @@ const ffmpegPath = (() => {
 import { PassThrough } from 'node:stream';
 import { constants as ytdlpConstants } from 'youtube-dl-exec';
 import { YouTube } from 'youtube-sr';
-import { createStream } from '../utils/youtube.js';
+import { createStream, getSessionTokens } from '../utils/youtube.js';
 import { getCookieFilePath } from '../utils/cookies.js';
 import { getWarpProxy } from '../utils/warp.js';
 
@@ -130,19 +130,97 @@ function proxyArgs(override) {
   return proxy ? ['--proxy', proxy] : [];
 }
 
-/** yt-dlp args for mobile client spoofing + optional cookies. */
+/**
+ * yt-dlp player clients that this yt-dlp build actually supports.
+ *
+ * `tv_embedded` was removed upstream and now triggers
+ *   WARNING: [youtube] Skipping unsupported client "tv_embedded"
+ * which silently shrinks the client list. Verified against yt-dlp 2026.08.19: valid values are
+ * web_safari, web_embedded, mweb, ios, android, tv, tv_simply, web, web_music, android_vr.
+ */
+const YTDLP_CLIENTS = 'ios,android,web_safari,web_embedded,mweb,tv';
+
+/**
+ * Build a single `--extractor-args youtube:...` flag from key=value pairs.
+ *
+ * MUST be one flag. yt-dlp keys extractor args by extractor name, so passing
+ * `--extractor-args youtube:a=1 --extractor-args youtube:b=2` makes the second REPLACE the
+ * first rather than merging. That is why player_client was being silently discarded: the
+ * following `youtube:player_skip=hls` overwrote it, leaving yt-dlp on its default client,
+ * which yields no usable audio formats — surfacing as "Requested format is not available".
+ *
+ * Verified with yt-dlp 2026.08.19: two flags → only "visionos player API JSON" is fetched;
+ * one semicolon-joined flag → ios, android, web safari, web embedded and mweb are all fetched.
+ *
+ * @param {Record<string, string|undefined>} pairs
+ */
+function extractorArgs(pairs) {
+  const parts = Object.entries(pairs)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${v}`);
+
+  return parts.length ? ['--extractor-args', `youtube:${parts.join(';')}`] : [];
+}
+
+let _poTokenLogged = false;
+
+/**
+ * PoToken args for yt-dlp, reusing the token this process already minted for InnerTube.
+ *
+ * yt-dlp cannot mint a PoToken itself. Without one it skips every format that requires one:
+ *   WARNING: ios client hls formats require a GVS PO Token which was not provided.
+ *            They will be skipped as they may yield HTTP Error 403.
+ * and with all formats skipped, `-f bestaudio/best` fails with "Requested format is not
+ * available". src/utils/potoken.js already produces a valid token every 3 hours, so we pass
+ * the same one through.
+ *
+ * The token is bound to visitor_data, so both must be supplied together and must match, and
+ * the binding must be `gvs` (the streaming endpoint) rather than `player`.
+ *
+ * @param {string} clients comma-separated client list the same invocation uses
+ * @returns {Record<string, string>} extractor-arg pairs to merge into extractorArgs()
+ */
+function poTokenPairs(clients) {
+  const { poToken, visitorData } = getSessionTokens();
+  if (!poToken || !visitorData) return {};
+
+  // One po_token entry per client; yt-dlp matches them by the CLIENT.CONTEXT prefix.
+  const tokens = clients
+    .split(',')
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .map((c) => `${c}.gvs+${poToken}`)
+    .join(',');
+
+  if (!_poTokenLogged) {
+    console.log(`[player] passing PoToken to yt-dlp (${poToken.length} chars, bound to visitor_data)`);
+    _poTokenLogged = true;
+  }
+
+  return { po_token: tokens, visitor_data: visitorData };
+}
+
+/**
+ * yt-dlp args for player client spoofing, PoToken reuse, and optional cookies.
+ *
+ * NOTE: no global `--add-header User-Agent:...` here. yt-dlp sets a UA per player client to
+ * match that client's context; forcing one iPhone UA across ios+android+web_safari+mweb makes
+ * every non-iOS client's fingerprint inconsistent.
+ */
 function antiBotArgs() {
   const cookies = resolveCookieFile();
   const args = [
-    '--js-runtimes', 'node', // Use Node.js for signature decryption
-    '--extractor-args', 'youtube:player_client=ios,android,tv_embedded,web_safari,web_embedded,mweb',
-    '--extractor-args', 'youtube:player_skip=hls',
+    '--js-runtimes', 'node', // Use Node.js for signature/n-challenge solving
+    ...extractorArgs({
+      player_client: YTDLP_CLIENTS,
+      player_skip: 'hls',
+      ...poTokenPairs(YTDLP_CLIENTS),
+    }),
     '--extractor-retries', '5',
     '--retry-sleep', 'extractor:3',
     '--referer', 'https://www.youtube.com/',
     '--no-check-certificate',
     '--add-header', 'Origin:https://www.youtube.com',
-    '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
   ];
   if (cookies) {
     args.push('--cookies', cookies);
@@ -285,7 +363,11 @@ export class Player {
       '--no-playlist',
       '--no-warnings',
       ...proxyArgs(),
-      '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
+      '--js-runtimes', 'node',
+      ...extractorArgs({
+        player_client: YTDLP_CLIENTS,
+        ...poTokenPairs(YTDLP_CLIENTS),
+      }),
       '--extractor-retries', '3',
       testUrl,
     ];
@@ -796,7 +878,7 @@ export class Player {
   /**
    * Builds an AudioResource for a track by streaming audio via yt-dlp.
    * Uses Node.js JS runtime for signature decryption (--js-runtimes node).
-   * Tries multiple player clients (android, ios, tv_embedded, web).
+   * Tries multiple player clients (see YTDLP_CLIENTS).
    * For JioSaavn tracks, streams directly from the provided audio URL.
    * For YouTube tracks, tries youtubei.js directly first.
    */
@@ -1073,63 +1155,37 @@ export class Player {
     const { bin, pre } = ytdlpCmd();
     const proxies = this._getProxies();
 
+    /**
+     * Single-client fallback strategy.
+     *
+     * Each one gets its own PoToken pair for that client, and its own single merged
+     * --extractor-args flag. These previously omitted the PoToken entirely, so they could only
+     * ever reach formats that don't require one.
+     */
+    const single = (client) => ({
+      name: client,
+      args: [
+        '--js-runtimes', 'node',
+        ...extractorArgs({
+          player_client: client,
+          ...poTokenPairs(client),
+        }),
+        '--extractor-retries', '5',
+        '--no-check-certificate',
+        '--referer', 'https://www.youtube.com/',
+        ...cookieArgs(),
+      ],
+    });
+
     const strategies = [
-      {
-        name: 'android+ios+tv+web',
-        args: [...antiBotArgs()],
-      },
-      {
-        name: 'web_safari',
-        args: [
-          '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=web_safari',
-          '--extractor-retries', '5',
-          '--no-check-certificate',
-          '--referer', 'https://www.youtube.com/',
-          ...cookieArgs(),
-        ],
-      },
-      {
-        name: 'web_embedded',
-        args: [
-          '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=web_embedded',
-          '--extractor-retries', '5',
-          '--no-check-certificate',
-          '--referer', 'https://www.youtube.com/',
-          ...cookieArgs(),
-        ],
-      },
-      {
-        name: 'mweb',
-        args: [
-          '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=mweb',
-          '--extractor-retries', '5',
-          '--no-check-certificate',
-          ...cookieArgs(),
-        ],
-      },
-      {
-        name: 'android',
-        args: [
-          '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=android',
-          '--extractor-retries', '5',
-          '--no-check-certificate',
-          ...cookieArgs(),
-        ],
-      },
-      {
-        name: 'ios',
-        args: [
-          '--js-runtimes', 'node',
-          '--extractor-args', 'youtube:player_client=ios',
-          '--extractor-retries', '5',
-          '--no-check-certificate',
-          ...cookieArgs(),
-        ],
-      },
+      // All clients at once, with cookies and PoToken — most likely to find a usable format.
+      { name: 'multi-client', args: [...antiBotArgs()] },
+      single('web_safari'),
+      single('web_embedded'),
+      single('mweb'),
+      single('android'),
+      single('ios'),
+      single('tv'),
     ];
 
     /* Egress selection ------------------------------------------------- *

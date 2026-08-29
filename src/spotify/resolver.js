@@ -843,7 +843,8 @@ async function fetchPlaylistViaYtdlp(url) {
       '--flat-playlist',
       '--playlist-items', `0:${MAX_PLAYLIST_TRACKS - 1}`,
       '--no-warnings',
-      '--extractor-args', 'youtube:player_client=ios,android,tv_embedded',
+      // tv_embedded was removed from yt-dlp and is now skipped with a warning.
+      '--extractor-args', 'youtube:player_client=ios,android,tv',
       url,
     ];
 
