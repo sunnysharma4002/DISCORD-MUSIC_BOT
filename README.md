@@ -135,14 +135,33 @@ Example JioSaavn URLs:
 - Song: `https://www.jiosaavn.com/song/kesariya/AgIAQyBeWlI`
 - Album: `https://www.jiosaavn.com/album/brahmastra/xq4v9ZFC9iA_`
 
-### 10. (Optional) YouTube Cookies
+### 10. YouTube Cookies
 
-To avoid YouTube rate limits, generate cookies:
-1. Log into YouTube in your browser
-2. Open DevTools → Application → Cookies → copy the `youtube.com` cookies
-3. Paste into `.env` as `YOUTUBE_COOKIES` (JSON format)
+Cookies are read from `yt-cookies.txt` in the project root (Netscape format), not from `.env`.
+Without a signed-in jar, every YouTube request is anonymous and age-gated or label-owned videos
+fail with `LOGIN_REQUIRED` / "Sign in to confirm you're not a bot".
 
-See: https://github.com/play-dl/play_dl/blob/master/play-dl/YouTube/README.md#using-cookies
+To export a jar:
+
+1. Open a **private/incognito window** and sign in to YouTube (use a throwaway account).
+2. Export all `youtube.com` cookies with the Cookie-Editor extension, in **Netscape** format.
+3. Save as `yt-cookies.txt` in the project root.
+4. Close the private window **without signing out** — signing out revokes the session server-side
+   and the exported cookies die with it.
+
+Verify before deploying:
+
+```bash
+yt-dlp --cookies yt-cookies.txt -f bestaudio --get-url "https://www.youtube.com/watch?v=<id>"
+```
+
+The bot checks the jar at startup and prints one of four verdicts: `missing`, `incomplete`
+(HttpOnly cookies were not exported), `expired` (past their date on disk), or revoked
+server-side (YouTube cleared them — the file still looks valid). Set
+`YOUTUBE_REQUIRE_COOKIES=true` to refuse to start instead of degrading to anonymous.
+
+Cookies on a datacenter IP get revoked within days. If that keeps happening, add residential
+proxies via `YTDLP_PROXIES`.
 
 ## Audio Pipeline
 

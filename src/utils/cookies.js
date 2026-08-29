@@ -14,8 +14,26 @@ const DEFAULT_COOKIE_FILE = join(projectRoot, 'yt-cookies.txt');
  */
 const ESSENTIAL_COOKIES = ['__Secure-1PSID', '__Secure-3PSID', 'HSID', 'SSID', 'SID'];
 
+/**
+ * Cookies YouTube clears (empty value + past expiry) when it decides a session is dead.
+ * Seeing these in a `Set-Cookie` response is proof of server-side revocation, which is a
+ * different failure from on-disk expiry and needs a different fix.
+ */
+const AUTH_COOKIES = [
+  'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',
+  '__Secure-1PSID', '__Secure-3PSID', 'LOGIN_INFO',
+];
+
+/** Short-lived cookies whose expiry says nothing about whether the session is alive. */
+const EPHEMERAL_PREFIXES = ['ST-', 'YSC', 'GPS', 'CONSISTENCY', 'VISITOR_INFO', 'PREF'];
+
+function isEphemeral(name) {
+  return EPHEMERAL_PREFIXES.some((p) => name.startsWith(p));
+}
+
 let _pathCache;
 let _headerCache;
+let _entriesCache;
 
 /**
  * Absolute path to the Netscape cookie file, or null when none exists.
@@ -42,24 +60,37 @@ export function getCookieFilePath() {
 }
 
 /**
- * Parse a Netscape cookie file into a `Cookie:` header string for youtubei.js.
+ * Parse a Netscape cookie file into structured entries.
  *
  * IMPORTANT: Netscape files mark HttpOnly cookies with a literal `#HttpOnly_` prefix on the
  * domain field. That prefix is NOT a comment — skipping those lines drops the cookies that
  * actually authenticate the session (__Secure-1PSID, __Secure-3PSID, HSID, LOGIN_INFO, ...),
  * leaving a half-built session that YouTube answers with a bot check.
+ *
+ * @returns {Array<{ name: string, value: string, domain: string, expires: number }>}
+ *          `expires` is a unix timestamp in seconds; 0 means a session cookie.
  */
-export function parseNetscapeCookies(contents) {
-  if (!contents) return undefined;
+export function parseNetscapeEntries(contents) {
+  if (!contents) return [];
   const trimmed = contents.trim();
-  if (!trimmed) return undefined;
+  if (!trimmed) return [];
 
   // A plain "name=value; name=value" header has no tab-separated table.
-  if (trimmed.includes('=') && !trimmed.includes('\t')) return trimmed;
+  if (trimmed.includes('=') && !trimmed.includes('\t')) {
+    return trimmed
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const eq = part.indexOf('=');
+        if (eq === -1) return null;
+        return { name: part.slice(0, eq), value: part.slice(eq + 1), domain: '', expires: 0 };
+      })
+      .filter(Boolean);
+  }
 
   const HTTP_ONLY_PREFIX = '#HttpOnly_';
-  const pairs = [];
-  const seen = new Set();
+  const byName = new Map();
 
   for (const rawLine of trimmed.split(/\r?\n/)) {
     let line = rawLine.trim();
@@ -78,23 +109,96 @@ export function parseNetscapeCookies(contents) {
     const value = parts[6]?.trim();
     if (!name || value === undefined) continue;
 
+    const expires = Number.parseInt(parts[4], 10);
+
     // A cookie name may appear only once in a header; later entries win.
-    if (seen.has(name)) {
-      const idx = pairs.findIndex((p) => p.startsWith(`${name}=`));
-      if (idx !== -1) pairs.splice(idx, 1);
-    }
-    seen.add(name);
-    pairs.push(`${name}=${value}`);
+    byName.set(name, {
+      name,
+      value,
+      domain: parts[0]?.trim() ?? '',
+      expires: Number.isFinite(expires) ? expires : 0,
+    });
   }
 
-  if (pairs.length === 0) return undefined;
+  return [...byName.values()];
+}
 
-  const missing = ESSENTIAL_COOKIES.filter((n) => !seen.has(n));
+/** Cached structured view of the jar on disk. */
+function getCookieEntries() {
+  if (_entriesCache !== undefined) return _entriesCache;
+
+  const path = getCookieFilePath();
+  if (!path) {
+    _entriesCache = [];
+    return _entriesCache;
+  }
+
+  try {
+    _entriesCache = parseNetscapeEntries(readFileSync(path, 'utf8'));
+  } catch (err) {
+    console.warn(`[cookies] failed to read ${path}: ${err.message}`);
+    _entriesCache = [];
+  }
+
+  return _entriesCache;
+}
+
+/**
+ * Static analysis of the jar on disk — no network. Tells apart the failure modes that all
+ * previously surfaced as one vague "expired or revoked" line:
+ *   - `missing`      : no jar file at all
+ *   - `incomplete`   : jar exists but lacks the cookies that carry the session
+ *   - `expired`      : the auth cookies themselves are past their expiry date
+ *   - `ok`           : nothing wrong on disk (may still be revoked server-side)
+ *
+ * @returns {{ verdict: 'missing'|'incomplete'|'expired'|'ok', total: number,
+ *             missing: string[], expired: string[], soonest: { name: string, date: string } | null }}
+ */
+export function inspectCookieJar() {
+  const entries = getCookieEntries();
+
+  if (entries.length === 0) {
+    return { verdict: 'missing', total: 0, missing: [...ESSENTIAL_COOKIES], expired: [], soonest: null };
+  }
+
+  const names = new Set(entries.map((e) => e.name));
+  const missing = ESSENTIAL_COOKIES.filter((n) => !names.has(n));
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expired = entries
+    .filter((e) => AUTH_COOKIES.includes(e.name) && e.expires > 0 && e.expires < nowSec)
+    .map((e) => e.name);
+
+  // Earliest upcoming expiry among cookies that actually matter, for a heads-up before it bites.
+  const upcoming = entries
+    .filter((e) => e.expires > nowSec && !isEphemeral(e.name))
+    .sort((a, b) => a.expires - b.expires)[0];
+
+  const soonest = upcoming
+    ? { name: upcoming.name, date: new Date(upcoming.expires * 1000).toISOString().slice(0, 10) }
+    : null;
+
+  let verdict = 'ok';
+  if (missing.length) verdict = 'incomplete';
+  else if (expired.length) verdict = 'expired';
+
+  return { verdict, total: entries.length, missing, expired, soonest };
+}
+
+/**
+ * Parse a Netscape cookie file into a `Cookie:` header string for youtubei.js.
+ */
+export function parseNetscapeCookies(contents) {
+  const entries = parseNetscapeEntries(contents);
+  if (entries.length === 0) return undefined;
+
+  const names = new Set(entries.map((e) => e.name));
+  const missing = ESSENTIAL_COOKIES.filter((n) => !names.has(n));
   if (missing.length) {
     console.warn(`[cookies] jar is missing ${missing.join(', ')} — session may not authenticate`);
   }
 
-  return pairs.join('; ');
+  return entries.map((e) => `${e.name}=${e.value}`).join('; ');
 }
 
 /**
@@ -103,26 +207,22 @@ export function parseNetscapeCookies(contents) {
 export function getCookieHeader() {
   if (_headerCache !== undefined) return _headerCache;
 
-  const path = getCookieFilePath();
-  if (!path) {
+  const entries = getCookieEntries();
+  if (entries.length === 0) {
+    const path = getCookieFilePath();
+    if (path) console.warn(`[cookies] ${path} contained no usable cookies`);
     _headerCache = undefined;
     return _headerCache;
   }
 
-  try {
-    const header = parseNetscapeCookies(readFileSync(path, 'utf8'));
-    _headerCache = header;
-    if (header) {
-      const count = header.split('; ').length;
-      console.log(`[cookies] loaded ${count} cookies for youtubei.js`);
-    } else {
-      console.warn(`[cookies] ${path} contained no usable cookies`);
-    }
-  } catch (err) {
-    console.warn(`[cookies] failed to read ${path}: ${err.message}`);
-    _headerCache = undefined;
+  const names = new Set(entries.map((e) => e.name));
+  const missing = ESSENTIAL_COOKIES.filter((n) => !names.has(n));
+  if (missing.length) {
+    console.warn(`[cookies] jar is missing ${missing.join(', ')} — session may not authenticate`);
   }
 
+  _headerCache = entries.map((e) => `${e.name}=${e.value}`).join('; ');
+  console.log(`[cookies] loaded ${entries.length} cookies for youtubei.js`);
   return _headerCache;
 }
 
@@ -133,6 +233,42 @@ const VALIDATE_UA =
 let _sessionCache;
 
 /**
+ * Detect a server-side logout. When Google decides a session is dead it replies with
+ * `Set-Cookie: SID=; expires=<past date>` for every auth cookie — an explicit instruction to
+ * delete them. That is proof of revocation, and it is invisible to on-disk expiry checks:
+ * the file can hold cookies dated a year out that Google already threw away.
+ *
+ * @returns {string[]} names of auth cookies the server told us to delete
+ */
+function detectRevokedCookies(res) {
+  const setCookies = typeof res.headers.getSetCookie === 'function'
+    ? res.headers.getSetCookie()
+    : [];
+
+  const revoked = new Set();
+  const nowMs = Date.now();
+
+  for (const raw of setCookies) {
+    const eq = raw.indexOf('=');
+    if (eq === -1) continue;
+
+    const name = raw.slice(0, eq);
+    if (!AUTH_COOKIES.includes(name)) continue;
+
+    const value = raw.slice(eq + 1).split(';')[0].trim();
+    const expiresMatch = raw.match(/expires=([^;]+)/i);
+    const expiresMs = expiresMatch ? Date.parse(expiresMatch[1].replace(/-/g, ' ')) : NaN;
+
+    // Empty value, or an expiry in the past, both mean "delete this".
+    if (value === '' || (Number.isFinite(expiresMs) && expiresMs < nowMs)) {
+      revoked.add(name);
+    }
+  }
+
+  return [...revoked];
+}
+
+/**
  * Ask YouTube whether the jar is actually signed in, and grab the Data Sync ID.
  *
  * This matters because youtubei.js infers `logged_in` purely from SAPISID being present —
@@ -141,14 +277,50 @@ let _sessionCache;
  * strong bot signal on a datacenter IP, and it also means a PoToken bound to visitor_data
  * is the wrong binding (a logged-in session must bind to the Data Sync ID).
  *
- * @returns {Promise<{ loggedIn: boolean, dataSyncId: string | null, visitorData: string | null }>}
+ * @returns {Promise<{ loggedIn: boolean, dataSyncId: string | null, visitorData: string | null,
+ *                     reason: string | null, revoked: string[] }>}
  */
 export async function validateCookieSession() {
   if (_sessionCache !== undefined) return _sessionCache;
 
+  const jar = inspectCookieJar();
+
   const header = getCookieHeader();
   if (!header) {
-    _sessionCache = { loggedIn: false, dataSyncId: null, visitorData: null };
+    _sessionCache = {
+      loggedIn: false,
+      dataSyncId: null,
+      visitorData: null,
+      reason: jar.verdict === 'missing' ? 'no cookie file' : 'jar has no usable cookies',
+      revoked: [],
+    };
+    return _sessionCache;
+  }
+
+  // On-disk problems are decisive: don't spend a round-trip proving what the file already says.
+  if (jar.verdict === 'incomplete') {
+    console.warn(`[cookies] jar is incomplete — missing ${jar.missing.join(', ')}`);
+    console.warn('[cookies] export ALL cookies for youtube.com, including HttpOnly ones');
+    _sessionCache = {
+      loggedIn: false,
+      dataSyncId: null,
+      visitorData: null,
+      reason: `missing ${jar.missing.join(', ')}`,
+      revoked: [],
+    };
+    return _sessionCache;
+  }
+
+  if (jar.verdict === 'expired') {
+    console.warn(`[cookies] auth cookies are past their expiry date: ${jar.expired.join(', ')}`);
+    console.warn('[cookies] re-export yt-cookies.txt from a browser where you are signed in');
+    _sessionCache = {
+      loggedIn: false,
+      dataSyncId: null,
+      visitorData: null,
+      reason: `expired on disk: ${jar.expired.join(', ')}`,
+      revoked: [],
+    };
     return _sessionCache;
   }
 
@@ -159,10 +331,17 @@ export async function validateCookieSession() {
 
     if (!res.ok) {
       console.warn(`[cookies] validation request failed: HTTP ${res.status}`);
-      _sessionCache = { loggedIn: false, dataSyncId: null, visitorData: null };
+      _sessionCache = {
+        loggedIn: false,
+        dataSyncId: null,
+        visitorData: null,
+        reason: `validation HTTP ${res.status}`,
+        revoked: [],
+      };
       return _sessionCache;
     }
 
+    const revoked = detectRevokedCookies(res);
     const html = await res.text();
     const loggedIn = /"LOGGED_IN":\s*true/.test(html);
 
@@ -177,23 +356,91 @@ export async function validateCookieSession() {
     const vdMatch = html.match(/"VISITOR_DATA":"([^"]+)"/);
     const visitorData = vdMatch ? vdMatch[1] : null;
 
+    let reason = null;
+
     if (loggedIn && dataSyncId) {
       console.log('[cookies] session validated: signed in');
+      if (jar.soonest) {
+        console.log(`[cookies] next cookie expiry: ${jar.soonest.name} on ${jar.soonest.date}`);
+      }
     } else if (loggedIn) {
-      console.warn('[cookies] session reports signed in but has no Data Sync ID');
+      reason = 'signed in but no Data Sync ID';
+      console.warn(`[cookies] ${reason}`);
+    } else if (revoked.length) {
+      // The decisive case: file looks fine, Google disagrees.
+      reason = `revoked server-side (YouTube cleared ${revoked.join(', ')})`;
+      console.warn(`[cookies] jar was REVOKED by YouTube — it cleared ${revoked.join(', ')}`);
+      console.warn('[cookies] the cookies are not expired on disk; the account session itself was invalidated');
+      console.warn('[cookies] cause: signing out in the source browser, a password change, or Google');
+      console.warn('[cookies]        rejecting the session because it is being replayed from a datacenter IP');
+      console.warn('[cookies] fix: re-export from a private window, then close it WITHOUT signing out');
     } else {
-      console.warn('[cookies] jar is NOT signed in (expired or revoked) — ignoring it');
+      reason = 'not signed in';
+      console.warn('[cookies] jar is NOT signed in — YouTube returned a logged-out page');
       console.warn('[cookies] re-export yt-cookies.txt from a browser where you are signed in');
     }
 
-    _sessionCache = { loggedIn: loggedIn && Boolean(dataSyncId), dataSyncId, visitorData };
+    _sessionCache = {
+      loggedIn: loggedIn && Boolean(dataSyncId),
+      dataSyncId,
+      visitorData,
+      reason,
+      revoked,
+    };
     return _sessionCache;
   } catch (err) {
     console.warn(`[cookies] could not validate session: ${err.message}`);
     // Network failure is not proof the jar is bad; assume usable and let InnerTube decide.
-    _sessionCache = { loggedIn: true, dataSyncId: null, visitorData: null };
+    _sessionCache = {
+      loggedIn: true,
+      dataSyncId: null,
+      visitorData: null,
+      reason: null,
+      revoked: [],
+    };
     return _sessionCache;
   }
+}
+
+/**
+ * One-shot startup report on the cookie jar.
+ *
+ * The old behaviour buried the single most consequential fact — that YouTube playback will
+ * fall back to anonymous and fail on anything gated — inside two warn lines among ~40 other
+ * startup lines. This states it plainly and, with YOUTUBE_REQUIRE_COOKIES=true, refuses to
+ * start rather than serving a bot that cannot play most tracks.
+ *
+ * @returns {Promise<boolean>} whether the jar is usable
+ */
+export async function reportCookieStatus() {
+  const jar = inspectCookieJar();
+  const session = await validateCookieSession();
+
+  const require = /^(1|true|yes)$/i.test(process.env.YOUTUBE_REQUIRE_COOKIES?.trim() ?? '');
+
+  if (session.loggedIn) {
+    console.log(`[cookies] PREFLIGHT OK — signed-in jar, ${jar.total} cookies`);
+    return true;
+  }
+
+  const lines = [
+    '[cookies] PREFLIGHT FAILED — the YouTube cookie jar is not usable',
+    `[cookies]   reason: ${session.reason ?? 'unknown'}`,
+    `[cookies]   file:   ${getCookieFilePath() ?? '<none>'}`,
+    `[cookies]   jar:    ${jar.total} cookies, verdict=${jar.verdict}`,
+    '[cookies]   effect: all YouTube requests fall back to anonymous. Age-gated and',
+    '[cookies]           label-owned videos will fail with LOGIN_REQUIRED / bot check.',
+  ];
+
+  if (require) {
+    lines.push('[cookies]   YOUTUBE_REQUIRE_COOKIES=true → refusing to start.');
+    for (const line of lines) console.error(line);
+    return false;
+  }
+
+  lines.push('[cookies]   set YOUTUBE_REQUIRE_COOKIES=true to make this fatal instead.');
+  for (const line of lines) console.warn(line);
+  return false;
 }
 
 /**
@@ -210,5 +457,6 @@ export async function getValidatedCookieHeader() {
 export function resetCookieCache() {
   _pathCache = undefined;
   _headerCache = undefined;
+  _entriesCache = undefined;
   _sessionCache = undefined;
 }

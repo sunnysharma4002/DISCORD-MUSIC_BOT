@@ -9,6 +9,7 @@ import { Client, GatewayIntentBits, Collection, ActivityType, MessageFlags } fro
 import { generateDependencyReport, AudioPlayerStatus } from '@discordjs/voice';
 import { Player } from './voice/Player.js';
 import { registerCommands } from './commands/handler.js';
+import { reportCookieStatus } from './utils/cookies.js';
 import dotenv from 'dotenv';
 import { writeFileSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -62,6 +63,15 @@ acquireLock();
 // Print the voice dependency report once — invaluable for diagnosing
 // "connects but no audio" issues (missing opus/sodium/ffmpeg).
 console.log(generateDependencyReport());
+
+/* Cookie preflight ----------------------------------------------------- */
+// Runs before login so a dead jar is reported up front rather than discovered
+// per-track. Only fatal when YOUTUBE_REQUIRE_COOKIES=true.
+const cookiesOk = await reportCookieStatus();
+if (!cookiesOk && /^(1|true|yes)$/i.test(process.env.YOUTUBE_REQUIRE_COOKIES?.trim() ?? '')) {
+  releaseLock();
+  process.exit(1);
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
