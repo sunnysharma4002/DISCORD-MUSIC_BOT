@@ -12,7 +12,7 @@ import {
 } from '@discordjs/voice';
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { spawn } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, copyFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import ffmpegStatic from 'ffmpeg-static';
@@ -96,22 +96,71 @@ function ytdlpCmd() {
   return { bin, pre };
 }
 
-// YouTube cookies for yt-dlp come from the yt-cookies.txt jar (see src/utils/cookies.js).
-// Bypasses bot checks and age gates on datacenter IPs.
+/*
+ * YouTube cookies for yt-dlp come from the yt-cookies.txt jar (see src/utils/cookies.js).
+ *
+ * CRITICAL: yt-dlp is given a THROWAWAY COPY, never the real jar.
+ *
+ * `--cookies FILE` is documented as "Netscape formatted file to read cookies from and dump
+ * cookie jar in" — it writes the jar back after every run. When YouTube answers the bot check
+ * it also sends `Set-Cookie: SID=; expires=<past>` for each auth cookie, and yt-dlp faithfully
+ * persists those deletions. Measured on this project's own jar with one yt-dlp invocation:
+ *
+ *   BEFORE: 25937 bytes, 41 cookie lines
+ *   AFTER :  1525 bytes, 11 cookie lines   ← __Secure-1PSID, HSID, SSID, SID all gone
+ *
+ * That is what destroyed every re-exported jar within minutes, and it also degraded
+ * youtubei.js to anonymous mid-session because it re-reads the same file on refresh.
+ *
+ * Handing yt-dlp a copy keeps the writeback harmless: it mutates the copy, the real jar is
+ * untouched. The copy is refreshed from disk whenever the source changes, so a re-export is
+ * still picked up.
+ */
 let _cookieLogged = false;
+let _cookieCopy = null;      // path to the throwaway
+let _cookieCopyKey = null;   // source mtime+size the copy was made from
+
+/** Where the disposable copy lives. Inside .cache so it is gitignored and disposable. */
+const _cookieCopyPath = join(_projectRoot, '.cache', 'yt-dlp-cookies.txt');
+
 function resolveCookieFile() {
-  const path = getCookieFilePath();
-  if (path && !_cookieLogged) {
-    console.log(`[player] yt-dlp will use cookies: ${path}`);
+  const source = getCookieFilePath();
+  if (!source) return null;
+
+  if (!_cookieLogged) {
+    console.log(`[player] yt-dlp will use cookies: ${source} (via a disposable copy)`);
     _cookieLogged = true;
   }
-  return path;
+
+  try {
+    const stat = statSync(source);
+    const key = `${stat.mtimeMs}:${stat.size}`;
+
+    // Re-copy when the jar is new or has been replaced (e.g. a fresh export).
+    if (_cookieCopy && _cookieCopyKey === key && existsSync(_cookieCopy)) {
+      return _cookieCopy;
+    }
+
+    mkdirSync(dirname(_cookieCopyPath), { recursive: true });
+    copyFileSync(source, _cookieCopyPath);
+    _cookieCopy = _cookieCopyPath;
+    _cookieCopyKey = key;
+    return _cookieCopy;
+  } catch (err) {
+    // Without a writable copy, passing the original would let yt-dlp shred it. Going
+    // cookie-less is the lesser harm: it only costs age-gated videos, which are already
+    // failing, whereas a destroyed jar breaks youtubei.js too.
+    console.warn(`[player] could not create a disposable cookie copy: ${err.message}`);
+    console.warn('[player] running yt-dlp WITHOUT cookies rather than risk destroying the jar');
+    return null;
+  }
 }
 
 /** Cookie args, if a cookie jar is available. Must be included in EVERY yt-dlp invocation. */
 function cookieArgs() {
   const cookies = resolveCookieFile();
-  return cookies ? ['--cookies', cookies] : [];
+  // --no-cookies-from-browser is explicit: never touch a local browser profile.
+  return cookies ? ['--cookies', cookies, '--no-cookies-from-browser'] : ['--no-cookies-from-browser'];
 }
 
 /**
@@ -266,6 +315,7 @@ function antiBotArgs() {
     '--referer', 'https://www.youtube.com/',
     '--no-check-certificate',
     '--add-header', 'Origin:https://www.youtube.com',
+    '--no-cookies-from-browser',
   ];
   if (cookies) {
     args.push('--cookies', cookies);
@@ -409,6 +459,9 @@ export class Player {
       '--no-warnings',
       ...proxyArgs(),
       '--js-runtimes', 'node',
+      // The startup probe is a reachability check on a public video; it needs no auth.
+      '--no-cookies',
+      '--no-cookies-from-browser',
       ...extractorArgs({
         player_client: YTDLP_CLIENTS,
         ...poTokenPairs(YTDLP_CLIENTS),

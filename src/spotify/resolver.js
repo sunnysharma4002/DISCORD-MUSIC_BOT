@@ -565,6 +565,10 @@ export async function resolveSoundCloud(rawUrl, requestedBy) {
       '--flat-playlist',
       '--dump-json',
       '--no-warnings',
+      // Explicit: this call needs no auth, and --cookies would make yt-dlp dump the mutated
+      // jar back to disk (see the note on resolveCookieFile in src/voice/Player.js).
+      '--no-cookies',
+      '--no-cookies-from-browser',
       '--extractor-retries', '3',
       url,
     ];
@@ -843,6 +847,10 @@ async function fetchPlaylistViaYtdlp(url) {
       '--flat-playlist',
       '--playlist-items', `0:${MAX_PLAYLIST_TRACKS - 1}`,
       '--no-warnings',
+      // Explicit: playlist listing needs no auth, and --cookies would make yt-dlp dump the
+      // mutated jar back to disk (see resolveCookieFile in src/voice/Player.js).
+      '--no-cookies',
+      '--no-cookies-from-browser',
       // tv_embedded was removed from yt-dlp and is now skipped with a warning.
       '--extractor-args', 'youtube:player_client=ios,android,tv',
       url,
