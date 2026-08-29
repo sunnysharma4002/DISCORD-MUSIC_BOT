@@ -201,16 +201,21 @@ Relevant variables (all optional, see `.env`):
 | `WARP_LICENSE_KEY` | WARP+ key, raises the bandwidth quota |
 | `YTDLP_PROXIES` | Extra proxies; full URLs (`socks5://…`, `http://user:pass@host:port`) or `host:port[:user:pass]` |
 
-Startup does two attempts: the default random endpoint, then `--scan`, which UDP-probes
-Cloudflare's ranges and keeps only responsive endpoints. The random pick can land on a dead or
-rate-limited endpoint, which is what `tunnel connectivity test failed` means.
+Startup walks an attempt ladder, stopping at the first one that works:
+
+1. **default endpoint** — random pick from Cloudflare's WARP ranges
+2. **`--scan`** — UDP-probes the ranges and uses only responsive endpoints
+3. **`--gool`** — tunnels WARP inside WARP, changing both the handshake target and exit region
+
+Setting `WARP_ENDPOINT` skips the ladder and uses only that endpoint.
 
 If WARP cannot start, the log names the cause:
 
 - `WireGuard handshake never completed` — the host blocks outbound UDP. WARP cannot work at
   all there; use `YTDLP_PROXIES`.
-- `handshake succeeded but no traffic flowed` — dead or rate-limited endpoint. The scan retry
-  usually clears it; otherwise pin `WARP_ENDPOINT`.
+- `handshake completed but no traffic flowed` — the endpoint answers UDP but drops tunnelled
+  packets (dead, rate-limited, or MTU-filtered). The ladder tries to route around this; if all
+  three rungs fail, this host cannot reach WARP.
 
 Everything degrades safely: no binary, a failed download, a failed handshake, or `warp=off`
 all just log a warning and fall back to the host IP. WARP is not guaranteed to work — its
@@ -283,7 +288,7 @@ package.json
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
 | `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start (the log names the cause). Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
 | `[warp] WireGuard handshake never completed` | Host blocks outbound UDP; WARP cannot work there. Use `YTDLP_PROXIES` |
-| `[warp] tunnel connectivity test failed` | Dead or rate-limited WARP endpoint. The automatic `--scan` retry usually fixes it; else pin `WARP_ENDPOINT=ip:port` |
+| `[warp] tunnel connectivity test failed` | The WARP endpoint answers UDP but drops tunnelled traffic. The ladder retries with `--scan` then `--gool`; if all fail, this host cannot reach WARP — use `YTDLP_PROXIES` |
 | YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. WARP or a proxy, not cookies |
 | `[cookies] PREFLIGHT FAILED` | Re-export `yt-cookies.txt`; the log states which of the four failure modes it is |
 | Spotify tracks not found | The embed scraper is rate-limited; wait a few seconds between requests |

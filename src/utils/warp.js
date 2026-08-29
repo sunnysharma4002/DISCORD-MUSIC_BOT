@@ -34,13 +34,20 @@ const DEFAULT_PORT = 8086;
 /**
  * Startup budget per attempt.
  *
- * warp-plus does its own bounded retrying and then exits: the WireGuard handshake gets 15s
- * (app/wg.go waitHandshake), then a tunnel connectivity test gets 5s, twice
- * (app/app.go runWarp), then the process calls os.Exit(1). So ~35s is the real ceiling and
- * anything longer is just waiting on a corpse. We also watch for the exit directly.
+ * warp-plus gives the WireGuard handshake 15s (app/wg.go waitHandshake), then runs a tunnel
+ * connectivity test with a 5s deadline (app/wg.go usermodeTunTest). In practice the process
+ * does NOT reliably exit after those attempts — observed retrying for 50s+ — so this timeout
+ * is the real backstop, not a formality.
  */
 const READY_TIMEOUT_MS = 40_000;
 const READY_POLL_MS = 500;
+
+/**
+ * Once the tunnel test has failed this many times, the endpoint is not going to start working.
+ * warp-plus loops the test with no backoff, so this count accrues in a couple of seconds and
+ * lets an attempt be abandoned in ~10s instead of waiting out READY_TIMEOUT_MS.
+ */
+const TEST_FAILURE_GIVE_UP = 60;
 
 /** How long to wait for the exit-IP probe before giving up on it (non-fatal). */
 const PROBE_TIMEOUT_MS = 15_000;
@@ -50,11 +57,27 @@ let _proxyUrl = null;
 let _startPromise = null;
 let _exitInfo = null;
 
-/** Absolute path to the warp-plus binary, or null when it is not vendored. */
+/**
+ * The warp-plus command, or null when it is not available.
+ *
+ * WARP_BIN is normally a plain path. It may also include leading arguments, matching how
+ * YTDLP_CMD works elsewhere in this project (e.g. "python -m yt_dlp") — useful for running
+ * warp-plus under a wrapper. The whole string is tried as a path first, so a path containing
+ * spaces still works and is not mistaken for a command plus arguments.
+ *
+ * @returns {{ bin: string, pre: string[] } | null}
+ */
 function resolveBin() {
   const override = process.env.WARP_BIN?.trim();
-  const candidate = override || DEFAULT_BIN;
-  return existsSync(candidate) ? candidate : null;
+
+  if (override) {
+    if (existsSync(override)) return { bin: override, pre: [] };
+
+    const [bin, ...pre] = override.split(/\s+/);
+    return existsSync(bin) ? { bin, pre } : null;
+  }
+
+  return existsSync(DEFAULT_BIN) ? { bin: DEFAULT_BIN, pre: [] } : null;
 }
 
 function port() {
@@ -195,20 +218,21 @@ async function probeExit(proxyPort) {
 }
 
 /**
- * Resolves once something accepts TCP on the bind port, rejects if the process dies first.
+ * Resolves once something accepts TCP on the bind port; rejects early if the child dies or if
+ * the tunnel test has clearly given up.
  *
  * The bind port is a reliable readiness signal because warp-plus only calls net.Listen AFTER
  * its tunnel connectivity test passes (wiresocks/proxy.go StartProxy, reached from
  * app/app.go runWarp only once usermodeTunTest returns nil). While the test is failing,
  * nothing is listening — so "port open" cannot be confused with "still retrying".
  *
- * @param {() => string|null} exitReason returns non-null once the child has exited
+ * @param {() => string|null} abortReason returns non-null once waiting is pointless
  */
-function waitForPort(p, deadline, exitReason) {
+function waitForPort(p, deadline, abortReason) {
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const dead = exitReason();
-      if (dead) return reject(new Error(`warp-plus exited before binding (${dead})`));
+      const abort = abortReason();
+      if (abort) return reject(new Error(abort));
 
       if (Date.now() > deadline) {
         return reject(new Error(`warp-plus did not open ${HOST}:${p} within ${READY_TIMEOUT_MS}ms`));
@@ -252,8 +276,8 @@ export async function startWarp() {
     return null;
   }
 
-  const bin = resolveBin();
-  if (!bin) {
+  const cmd = resolveBin();
+  if (!cmd) {
     if (process.platform === 'linux') {
       console.warn(`[warp] binary not found at ${process.env.WARP_BIN?.trim() || DEFAULT_BIN}`);
       console.warn('[warp] run "node scripts/setup-warp.mjs" to vendor it — continuing without WARP');
@@ -267,15 +291,31 @@ export async function startWarp() {
     try {
       // A pinned endpoint means the user knows which one works; don't second-guess it.
       const pinned = process.env.WARP_ENDPOINT?.trim();
+
+      /*
+       * Attempt ladder, cheapest and most likely first.
+       *
+       * The two failure modes seen in practice, and what each attempt does about them:
+       *   - random endpoint is dead/rate-limited  → --scan finds a responsive one
+       *   - the whole plain-WARP path is filtered → --gool tunnels WARP inside WARP, which
+       *     changes both the handshake target and the exit region
+       *
+       * --gool is last because it is slower and doubles the crypto, but it is the only option
+       * that survives an endpoint range being wholesale unusable. It is skipped when the user
+       * already asked for it via WARP_GOOL, since then every attempt has it.
+       */
+      const goolForced = /^(1|true|yes|on)$/i.test(process.env.WARP_GOOL?.trim() ?? '');
+
       const attempts = pinned
         ? [{ label: `endpoint ${pinned}`, extra: ['--endpoint', pinned] }]
         : [
             { label: 'default endpoint', extra: [] },
             { label: 'endpoint scan', extra: ['--scan', '--rtt', '1s'] },
+            ...(goolForced ? [] : [{ label: 'gool (warp-in-warp)', extra: ['--gool'] }]),
           ];
 
       for (const attempt of attempts) {
-        const url = await tryStart(bin, attempt);
+        const url = await tryStart(cmd, attempt);
         if (url) {
           _proxyUrl = url;
           return url;
@@ -283,6 +323,7 @@ export async function startWarp() {
       }
 
       console.warn('[warp] all startup attempts failed — yt-dlp will use the host IP');
+      console.warn('[warp] this host cannot reach Cloudflare WARP; residential proxies via YTDLP_PROXIES are the remaining option');
       return null;
     } finally {
       _startPromise = null;
@@ -296,7 +337,7 @@ export async function startWarp() {
  * One warp-plus startup attempt. Returns the proxy URL, or null on failure.
  * Cleans up the child process on every failure path so attempts don't stack up.
  */
-async function tryStart(bin, { label, extra }) {
+async function tryStart({ bin, pre }, { label, extra }) {
   const p = port();
   const args = [
     '--bind', `${HOST}:${p}`,
@@ -311,27 +352,36 @@ async function tryStart(bin, { label, extra }) {
 
   // gool chains WARP through a second WARP hop, which changes the apparent exit region.
   // Slower, but a different exit range — worth trying if the plain exit is blocked.
-  if (/^(1|true|yes|on)$/i.test(process.env.WARP_GOOL?.trim() ?? '')) args.push('--gool');
+  // Skipped when this attempt already passes --gool, to avoid duplicating the flag.
+  if (
+    /^(1|true|yes|on)$/i.test(process.env.WARP_GOOL?.trim() ?? '') &&
+    !extra.includes('--gool')
+  ) {
+    args.push('--gool');
+  }
 
   mkdirSync(CACHE_DIR, { recursive: true });
 
   console.log(`[warp] starting warp-plus on ${HOST}:${p} (${label})...`);
 
-  const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(bin, [...pre, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
   _proc = proc;
 
   /*
    * Log relay.
    *
    * warp-plus retries its tunnel connectivity test in a tight loop with no backoff — an
-   * unreachable endpoint yields hundreds of identical `connection test failed` lines in the
-   * 5-second window, twice. Relaying those verbatim buried the actual startup in ~400 lines
-   * of noise. We count repeats instead and emit one summary, and we track which failure mode
+   * unreachable endpoint yields hundreds of identical `connection test failed` lines in a
+   * couple of seconds. Relaying those verbatim buried the actual startup in ~400 lines of
+   * noise. We count repeats instead and emit one summary, and we track which failure mode
    * happened so the final message can name a cause.
+   *
+   * The counts are also a control signal: see TEST_FAILURE_GIVE_UP.
    */
   const seen = new Map();
   let sawHandshakeTimeout = false;
   let sawTestFailure = false;
+  let scanPingErrors = 0;
 
   const relay = (chunk) => {
     for (const line of chunk.toString().split('\n')) {
@@ -346,6 +396,11 @@ async function tryStart(bin, { label, extra }) {
       if (/context deadline exceeded|waiting on handshake/i.test(t)) {
         sawHandshakeTimeout = true;
         seen.set('handshake', (seen.get('handshake') ?? 0) + 1);
+        continue;
+      }
+      // Scanner probes many endpoints and most don't answer; individual misses are expected.
+      if (/subsystem=scanner/i.test(t) && /ping error/i.test(t)) {
+        scanPingErrors++;
         continue;
       }
       // "failed to load identity" on a cold cache is normal — it registers immediately after.
@@ -379,18 +434,34 @@ async function tryStart(bin, { label, extra }) {
     const handshakes = seen.get('handshake') ?? 0;
     if (tests) console.warn(`[warp] tunnel connectivity test failed (${tests} attempts)`);
     if (handshakes) console.warn(`[warp] WireGuard handshake never completed (${handshakes} polls)`);
+    if (scanPingErrors) console.warn(`[warp] scanner found no responsive endpoint (${scanPingErrors} probes failed)`);
 
     if (sawHandshakeTimeout && !sawTestFailure) {
       console.warn('[warp] cause: no WireGuard handshake — outbound UDP is blocked by this host');
       console.warn('[warp] a host that blocks outbound UDP cannot run WARP at all; use YTDLP_PROXIES instead');
     } else if (sawTestFailure) {
-      console.warn('[warp] cause: handshake succeeded but no traffic flowed through the tunnel');
-      console.warn('[warp] usually a dead or rate-limited endpoint; pin a known-good one with WARP_ENDPOINT=ip:port');
+      console.warn('[warp] cause: handshake completed but no traffic flowed through the tunnel');
+      console.warn('[warp] the endpoint answers UDP but drops tunnelled packets — dead, rate-limited, or MTU-filtered');
     }
   };
 
+  /**
+   * Reason to stop waiting, or null to keep waiting.
+   *
+   * Two early exits, both about not burning the full timeout on a lost cause:
+   *   - the child died (it can also keep running and never bind, hence the second case)
+   *   - the tunnel test has failed enough times that it clearly will not recover
+   */
+  const abortReason = () => {
+    if (exited) return `warp-plus exited before binding (${exited})`;
+    if ((seen.get('test') ?? 0) >= TEST_FAILURE_GIVE_UP) {
+      return `tunnel unusable after ${seen.get('test')} failed connectivity tests`;
+    }
+    return null;
+  };
+
   try {
-    await waitForPort(p, Date.now() + READY_TIMEOUT_MS, () => exited);
+    await waitForPort(p, Date.now() + READY_TIMEOUT_MS, abortReason);
 
     const url = `socks5://${HOST}:${p}`;
 
