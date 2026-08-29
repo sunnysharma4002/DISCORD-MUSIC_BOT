@@ -18,7 +18,7 @@
 // The binary is vendored by scripts/setup-warp.mjs. Everything here degrades to "no proxy"
 // when it is absent, so nothing breaks on Windows or when setup was skipped.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
@@ -295,7 +295,7 @@ export async function startWarp() {
       /*
        * Attempt ladder, cheapest and most likely first.
        *
-       * The two failure modes seen in practice, and what each attempt does about them:
+       * The endpoint-related failure modes, and what each attempt does about them:
        *   - random endpoint is dead/rate-limited  → --scan finds a responsive one
        *   - the whole plain-WARP path is filtered → --gool tunnels WARP inside WARP, which
        *     changes both the handshake target and the exit region
@@ -314,11 +314,36 @@ export async function startWarp() {
             ...(goolForced ? [] : [{ label: 'gool (warp-in-warp)', extra: ['--gool'] }]),
           ];
 
-      for (const attempt of attempts) {
-        const url = await tryStart(cmd, attempt);
+      let purgedCache = false;
+
+      for (let i = 0; i < attempts.length; i++) {
+        const { url, failure } = await tryStart(cmd, attempts[i]);
         if (url) {
           _proxyUrl = url;
           return url;
+        }
+
+        /*
+         * Registration failure is not about endpoints, so walking the rest of the ladder is
+         * pointless — every rung would fail identically for the same reason. A stale cached
+         * identity is one cause we can actually fix, so purge it and retry the same attempt
+         * once; if that also fails, Cloudflare is refusing this IP and WARP is unavailable.
+         */
+        if (failure === 'register') {
+          if (!purgedCache && existsSync(CACHE_DIR)) {
+            console.warn('[warp] discarding cached WARP identity and re-registering once...');
+            purgedCache = true;
+            try {
+              rmSync(CACHE_DIR, { recursive: true, force: true });
+            } catch (err) {
+              console.warn(`[warp] could not clear ${CACHE_DIR}: ${err.message}`);
+            }
+            i--; // retry the same rung with a clean cache
+            continue;
+          }
+
+          console.warn('[warp] skipping remaining attempts — registration failure is not endpoint-related');
+          break;
         }
       }
 
@@ -334,8 +359,11 @@ export async function startWarp() {
 }
 
 /**
- * One warp-plus startup attempt. Returns the proxy URL, or null on failure.
+ * One warp-plus startup attempt.
+ *
  * Cleans up the child process on every failure path so attempts don't stack up.
+ *
+ * @returns {Promise<{ url: string|null, failure: 'register'|'tunnel'|'handshake'|'other'|null }>}
  */
 async function tryStart({ bin, pre }, { label, extra }) {
   const p = port();
@@ -381,6 +409,7 @@ async function tryStart({ bin, pre }, { label, extra }) {
   const seen = new Map();
   let sawHandshakeTimeout = false;
   let sawTestFailure = false;
+  let sawRegistrationFailure = false;
   let scanPingErrors = 0;
 
   const relay = (chunk) => {
@@ -396,6 +425,16 @@ async function tryStart({ bin, pre }, { label, extra }) {
       if (/context deadline exceeded|waiting on handshake/i.test(t)) {
         sawHandshakeTimeout = true;
         seen.set('handshake', (seen.get('handshake') ?? 0) + 1);
+        continue;
+      }
+      /*
+       * Registration failure: warp-plus could not obtain a WARP identity from Cloudflare's
+       * API, so there is no key material and it exits before any tunnel work. Distinct from
+       * the handshake and tunnel-test failures — nothing about endpoints or UDP is involved.
+       */
+      if (/couldn't load primary warp identity/i.test(t) || /API request failed with status/i.test(t)) {
+        sawRegistrationFailure = true;
+        seen.set('register', (seen.get('register') ?? 0) + 1);
         continue;
       }
       // Scanner probes many endpoints and most don't answer; individual misses are expected.
@@ -436,7 +475,12 @@ async function tryStart({ bin, pre }, { label, extra }) {
     if (handshakes) console.warn(`[warp] WireGuard handshake never completed (${handshakes} polls)`);
     if (scanPingErrors) console.warn(`[warp] scanner found no responsive endpoint (${scanPingErrors} probes failed)`);
 
-    if (sawHandshakeTimeout && !sawTestFailure) {
+    if (sawRegistrationFailure) {
+      console.warn('[warp] cause: Cloudflare refused to issue a WARP identity (API 400)');
+      console.warn('[warp] this is account registration, not networking — the tunnel was never attempted');
+      console.warn('[warp] usually means this IP is rate-limited by the WARP registration API,');
+      console.warn('[warp] or the cached identity in .cache/warp is stale — delete it to re-register');
+    } else if (sawHandshakeTimeout && !sawTestFailure) {
       console.warn('[warp] cause: no WireGuard handshake — outbound UDP is blocked by this host');
       console.warn('[warp] a host that blocks outbound UDP cannot run WARP at all; use YTDLP_PROXIES instead');
     } else if (sawTestFailure) {
@@ -448,11 +492,13 @@ async function tryStart({ bin, pre }, { label, extra }) {
   /**
    * Reason to stop waiting, or null to keep waiting.
    *
-   * Two early exits, both about not burning the full timeout on a lost cause:
-   *   - the child died (it can also keep running and never bind, hence the second case)
+   * Three early exits, all about not burning the full timeout on a lost cause:
+   *   - registration was refused, so there is no identity and nothing will ever bind
+   *   - the child died (it can also keep running and never bind, hence the third case)
    *   - the tunnel test has failed enough times that it clearly will not recover
    */
   const abortReason = () => {
+    if (sawRegistrationFailure) return 'Cloudflare refused to issue a WARP identity';
     if (exited) return `warp-plus exited before binding (${exited})`;
     if ((seen.get('test') ?? 0) >= TEST_FAILURE_GIVE_UP) {
       return `tunnel unusable after ${seen.get('test')} failed connectivity tests`;
@@ -472,7 +518,7 @@ async function tryStart({ bin, pre }, { label, extra }) {
         console.warn(`[warp] proxy is up but WARP is OFF (exit ip ${_exitInfo.ip ?? 'unknown'})`);
         console.warn('[warp] traffic would leave via the host IP anyway — not using it');
         killProc(proc);
-        return null;
+        return { url: null, failure: 'tunnel' };
       }
       console.log(`[warp] ready: ${url} (exit ip ${_exitInfo.ip ?? 'unknown'}, warp=${_exitInfo.warp ?? 'unknown'})`);
     } catch (err) {
@@ -482,12 +528,22 @@ async function tryStart({ bin, pre }, { label, extra }) {
       console.log(`[warp] ready: ${url} (unverified)`);
     }
 
-    return url;
+    return { url, failure: null };
   } catch (err) {
     console.warn(`[warp] ${label} failed: ${err.message}`);
     summarise();
     killProc(proc);
-    return null;
+
+    // Classify so the caller can decide whether walking the rest of the ladder is worthwhile.
+    const failure = sawRegistrationFailure
+      ? 'register'
+      : sawTestFailure
+        ? 'tunnel'
+        : sawHandshakeTimeout
+          ? 'handshake'
+          : 'other';
+
+    return { url: null, failure };
   }
 }
 

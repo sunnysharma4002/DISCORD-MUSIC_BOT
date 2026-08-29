@@ -209,8 +209,12 @@ Startup walks an attempt ladder, stopping at the first one that works:
 
 Setting `WARP_ENDPOINT` skips the ladder and uses only that endpoint.
 
-If WARP cannot start, the log names the cause:
+If WARP cannot start, the log names which of three unrelated things went wrong:
 
+- `Cloudflare refused to issue a WARP identity (API 400)` — registration, not networking. The
+  tunnel was never attempted. Usually this IP is rate-limited by the WARP registration API. The
+  bot purges `.cache/warp` and retries once, then stops (the other ladder rungs would fail
+  identically).
 - `WireGuard handshake never completed` — the host blocks outbound UDP. WARP cannot work at
   all there; use `YTDLP_PROXIES`.
 - `handshake completed but no traffic flowed` — the endpoint answers UDP but drops tunnelled
@@ -287,6 +291,7 @@ package.json
 | "Nothing is playing" | Ensure bot is in the same voice channel as you |
 | Commands not appearing | Run `npm run deploy` and check `GUILD_ID` is correct |
 | `Sign in to confirm you're not a bot` | Source-IP block, not a cookie problem. Check the startup log for `[warp] ready:` — if absent, WARP failed to start (the log names the cause). Then try `WARP_GOOL=true`, then residential proxies via `YTDLP_PROXIES` |
+| `[warp] Cloudflare refused to issue a WARP identity` | WARP registration API rejected this IP (rate limit). Not fixable locally; use `YTDLP_PROXIES` |
 | `[warp] WireGuard handshake never completed` | Host blocks outbound UDP; WARP cannot work there. Use `YTDLP_PROXIES` |
 | `[warp] tunnel connectivity test failed` | The WARP endpoint answers UDP but drops tunnelled traffic. The ladder retries with `--scan` then `--gool`; if all fail, this host cannot reach WARP — use `YTDLP_PROXIES` |
 | YouTube rate limit (HTTP 429) | Same as above — the IP is flagged. WARP or a proxy, not cookies |
