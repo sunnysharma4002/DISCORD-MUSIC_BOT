@@ -33,30 +33,19 @@ function buildRelayHeaders() {
 
 /**
  * Make a relay request.
- * Cloudflare: forwards to target via x-relay-target header
- * Vercel: direct endpoint calls
+ * Both Cloudflare and Vercel relays use the generic proxy pattern with x-relay-target header.
  */
 async function relayRequest(target, path, options = {}) {
-  if (IS_CLOUDFLARE) {
-    // Cloudflare relay: generic proxy
-    const url = `${RELAY_URL}${path}`;
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        ...buildRelayHeaders(),
-        'x-relay-target': target,
-        'x-relay-path': path,
-      },
-    });
-    return res;
-  } else {
-    // Vercel relay: direct endpoint
-    const url = `${RELAY_URL}${path}`;
-    return fetch(url, {
-      ...options,
-      headers: buildRelayHeaders(),
-    });
-  }
+  const url = `${RELAY_URL}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      ...buildRelayHeaders(),
+      'x-relay-target': target,
+      'x-relay-path': path,
+    },
+  });
+  return res;
 }
 
 /** Search YouTube via the relay. Returns array of video objects or null. */
@@ -64,41 +53,24 @@ export async function relaySearch(query, limit = 5) {
   if (!ENABLED) return null;
 
   try {
-    // Try API search endpoint first (fast, structured JSON, immune to CAPTCHAs)
-    const url = new URL(`${RELAY_URL}/api/search`);
-    url.searchParams.set('q', query);
-    url.searchParams.set('limit', String(limit));
+    // Generic proxy relay: forward to YouTube search page
+    const targetUrl = 'https://www.youtube.com';
+    const path = `/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%253D%253D`;
 
-    const res = await fetch(url.toString(), {
-      headers: buildRelayHeaders(),
+    const pRes = await relayRequest(targetUrl, path, {
       signal: AbortSignal.timeout(10_000),
     });
 
-    if (res.ok) {
-      const data = await res.json();
-      if (data.results && data.results.length > 0) {
-        console.log(`[relay] search via ${RELAY_TYPE}: ${data.results.length} results for "${query.substring(0, 40)}"`);
-        return data.results.slice(0, limit);
+    if (pRes.ok) {
+      const html = await pRes.text();
+      const results = parseYouTubeSearchHTML(html);
+      if (results.length > 0) {
+        console.log(`[relay] search via ${RELAY_TYPE}: ${results.length} results for "${query.substring(0, 40)}"`);
+        return results.slice(0, limit);
       }
-    }
-
-    // Fallback for older generic proxy relays
-    if (IS_CLOUDFLARE) {
-      const targetUrl = 'https://www.youtube.com';
-      const path = `/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%253D%253D`;
-
-      const pRes = await relayRequest(targetUrl, path, {
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (pRes.ok) {
-        const html = await pRes.text();
-        const results = parseYouTubeSearchHTML(html);
-        if (results.length > 0) {
-          console.log(`[relay] search HTML via ${RELAY_TYPE}: ${results.length} results for "${query.substring(0, 40)}"`);
-          return results.slice(0, limit);
-        }
-      }
+    } else {
+      const text = await pRes.text().catch(() => 'unknown');
+      console.warn(`[relay] search HTTP ${pRes.status}: ${text.substring(0, 200)}`);
     }
 
     return null;
@@ -113,35 +85,22 @@ export async function relayVideoInfo(videoId) {
   if (!ENABLED) return null;
 
   try {
-    const url = new URL(`${RELAY_URL}/api/video-info`);
-    url.searchParams.set('id', videoId);
+    const targetUrl = 'https://www.youtube.com';
+    const path = `/watch?v=${videoId}`;
 
-    const res = await fetch(url.toString(), {
-      headers: buildRelayHeaders(),
+    const pRes = await relayRequest(targetUrl, path, {
       signal: AbortSignal.timeout(8_000),
     });
 
-    if (res.ok) {
-      const data = await res.json();
-      console.log(`[relay] video-info via ${RELAY_TYPE}: "${data.title?.substring(0, 50)}"`);
-      return data;
-    }
-
-    if (IS_CLOUDFLARE) {
-      const targetUrl = 'https://www.youtube.com';
-      const path = `/watch?v=${videoId}`;
-
-      const pRes = await relayRequest(targetUrl, path, {
-        signal: AbortSignal.timeout(8_000),
-      });
-
-      if (pRes.ok) {
-        const html = await pRes.text();
-        const title = parseYouTubeTitle(html);
-        const author = parseYouTubeAuthor(html);
-        console.log(`[relay] video-info HTML via ${RELAY_TYPE}: "${title?.substring(0, 50)}"`);
-        return { title, author };
-      }
+    if (pRes.ok) {
+      const html = await pRes.text();
+      const title = parseYouTubeTitle(html);
+      const author = parseYouTubeAuthor(html);
+      console.log(`[relay] video-info via ${RELAY_TYPE}: "${title?.substring(0, 50)}"`);
+      return { id: videoId, title, author };
+    } else {
+      const text = await pRes.text().catch(() => 'unknown');
+      console.warn(`[relay] video-info HTTP ${pRes.status}: ${text.substring(0, 200)}`);
     }
 
     return null;
@@ -153,61 +112,58 @@ export async function relayVideoInfo(videoId) {
 
 /**
  * Get a proxied audio stream URL from the relay.
- * Cloudflare: uses youtubei.js to get YouTube stream URL
- * Vercel: uses direct endpoint
+ * Uses the generic proxy pattern with x-relay-target header.
+ * Forwards Innertube player API POST requests through the relay.
  */
 export async function relayAudioStream(videoId) {
   if (!ENABLED) return null;
 
   try {
-    if (IS_CLOUDFLARE) {
-      // Cloudflare relay: use youtubei.js to get YouTube stream URL
-      const url = `${RELAY_URL}/api/stream?id=${videoId}`;
-      const res = await fetch(url, {
-        headers: buildRelayHeaders(),
-        signal: AbortSignal.timeout(15_000),
-      });
+    const targetUrl = 'https://www.youtube.com';
+    const path = `/youtubei/v1/player`;
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] stream HTTP ${res.status}: ${text.substring(0, 300)}`);
-        return null;
-      }
+    const playerRequestBody = {
+      context: {
+        client: {
+          clientName: 'WEB',
+          clientVersion: '2.20240111.09.00',
+        },
+      },
+      videoId: videoId,
+    };
 
-      const data = await res.json();
-      if (!data.streamUrl) {
-        console.warn(`[relay] no streamUrl in response: ${JSON.stringify(data).substring(0, 200)}`);
-        return null;
-      }
+    const pRes = await relayRequest(targetUrl, path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-relay-target': targetUrl,
+        'x-relay-path': path,
+      },
+      body: JSON.stringify(playerRequestBody),
+      signal: AbortSignal.timeout(15_000),
+    });
 
-      console.log(`[relay] got YouTube stream URL via Cloudflare: ${data.mimeType || 'audio'} ${data.bitrate ? `${Math.round(data.bitrate/1000)}kbps` : ''}`);
-      return data.streamUrl;
-    } else {
-      // Vercel relay: direct endpoint
-      const vurl = new URL(`${RELAY_URL}/api/stream`);
-      vurl.searchParams.set('id', videoId);
-      vurl.searchParams.set('format', 'audio');
-
-      const res = await fetch(vurl.toString(), {
-        headers: buildRelayHeaders(),
-        signal: AbortSignal.timeout(15_000),
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => 'unknown');
-        console.warn(`[relay] stream HTTP ${res.status}: ${text.substring(0, 300)}`);
-        return null;
-      }
-
-      const data = await res.json();
-      if (!data.streamUrl) {
-        console.warn(`[relay] no streamUrl in response: ${JSON.stringify(data).substring(0, 200)}`);
-        return null;
-      }
-
-      console.log(`[relay] got stream URL for ${videoId} via ${RELAY_TYPE}`);
-      return data.streamUrl;
+    if (!pRes.ok) {
+      const text = await pRes.text().catch(() => 'unknown');
+      console.warn(`[relay] stream HTTP ${pRes.status}: ${text.substring(0, 300)}`);
+      return null;
     }
+
+    const data = await pRes.json();
+    const formats = data?.streamingData?.adaptiveFormats || [];
+    const audioFormats = formats.filter((f) => f.audioQuality && f.url);
+
+    if (audioFormats.length === 0) {
+      console.warn(`[relay] no audio formats in response for ${videoId}`);
+      return null;
+    }
+
+    // Prefer Opus, then highest bitrate
+    const opus = audioFormats.filter((f) => /opus/i.test(f.mimeType));
+    const best = (opus.length ? opus : audioFormats).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+    console.log(`[relay] got stream URL for ${videoId} via ${RELAY_TYPE}: ${best.mimeType || 'audio'} ${best.bitrate ? `${Math.round(best.bitrate/1000)}kbps` : ''}`);
+    return best.url;
   } catch (err) {
     console.warn(`[relay] stream URL fetch failed: ${err.message}`);
     return null;

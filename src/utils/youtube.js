@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getCookieHeader, validateCookieSession, resetCookieCache } from './cookies.js';
 import { generatePoToken } from './potoken.js';
+import { relaySearch, relayVideoInfo, relayAudioStream, isRelayEnabled } from './relay.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(dirname(__dirname));
@@ -453,6 +454,14 @@ export async function resetYouTubeSession() {
 
 /** Search YouTube and return up to `limit` video results. */
 export async function search(query, limit = 5) {
+  // Try relay first (bypasses bot checks via edge IP)
+  if (isRelayEnabled()) {
+    const relayResults = await relaySearch(query, limit);
+    if (relayResults && relayResults.length > 0) {
+      return relayResults;
+    }
+  }
+
   const yt = await getYouTube();
 
   try {
@@ -490,6 +499,21 @@ export async function search(query, limit = 5) {
  * Returns null if the video cannot be loaded.
  */
 export async function getVideoInfo(videoId) {
+  // Try relay first (bypasses bot checks via edge IP)
+  if (isRelayEnabled()) {
+    const relayInfo = await relayVideoInfo(videoId);
+    if (relayInfo && relayInfo.title) {
+      return {
+        id: relayInfo.id || videoId,
+        title: relayInfo.title,
+        author: relayInfo.author || 'Unknown',
+        duration: relayInfo.duration || 0,
+        thumbnail: relayInfo.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        isLive: Boolean(relayInfo.isLive),
+      };
+    }
+  }
+
   const yt = await getYouTube();
   let lastError = null;
 
@@ -518,10 +542,18 @@ export async function getVideoInfo(videoId) {
 
 /**
  * Get a direct audio stream URL for a video.
- * Tries multiple InnerTube clients (no po_token needed) and returns the best audio format URL.
- * Returns null if no stream URL can be obtained.
+ * Tries the relay first, then multiple InnerTube clients (no po_token needed).
+ * Returns the best audio format URL or null if no stream URL can be obtained.
  */
 export async function getStreamUrl(videoId) {
+  // Try relay first (bypasses bot checks via edge IP)
+  if (isRelayEnabled()) {
+    const relayStream = await relayAudioStream(videoId);
+    if (relayStream) {
+      return relayStream;
+    }
+  }
+
   const yt = await getYouTube();
   let lastError = null;
 
@@ -650,10 +682,10 @@ async function probeReadable(webStream) {
 }
 
 /**
- * Create an audio stream for a video, trying each InnerTube client in turn.
+ * Create an audio stream for a video, trying the relay first, then each InnerTube client.
  *
- * YouTube accepts a given client's stream URLs inconsistently (403s vary by client, video and
- * server IP), so we fall through to the next client on any failure. `exclude` lets the caller
+ * The relay routes requests through edge IPs to bypass YouTube bot checks. If the relay
+ * fails or is disabled, we fall back to InnerTube clients. `exclude` lets the caller
  * skip clients that already failed for this track — used to recover mid-playback.
  *
  * If every client reports a bot check, the session's PoToken has gone stale: we re-mint it
@@ -663,6 +695,39 @@ async function probeReadable(webStream) {
  * `.permanent = true` when the video can never be played (DRM, login required, etc).
  */
 export async function createStream(videoId, { exclude, _retried = false } = {}) {
+  // Try relay first (bypasses bot checks via edge IP)
+  if (isRelayEnabled() && !_retried) {
+    const relayStreamUrl = await relayAudioStream(videoId);
+    if (relayStreamUrl) {
+      console.log(`[youtube] stream via vercel relay: ${videoId}`);
+      try {
+        const res = await fetch(relayStreamUrl);
+        if (res.ok && res.body) {
+          const reader = res.body.getReader();
+          const first = await reader.read();
+          const out = new Readable({
+            read() {
+              reader.read().then(
+                ({ done, value }) => {
+                  this.push(done ? null : value);
+                },
+                (err) => this.destroy(err),
+              );
+            },
+            destroy(err, cb) {
+              reader.cancel().catch(() => {});
+              cb(err);
+            },
+          });
+          if (!first.done) out.push(first.value);
+          return { stream: out, isOpus: false, client: 'vercel-relay', isLive: false, hlsUrl: null };
+        }
+      } catch (err) {
+        console.warn(`[youtube] relay stream probe failed: ${err.message}`);
+      }
+    }
+  }
+
   const yt = await getYouTube();
   const excluded = exclude instanceof Set ? exclude : new Set(exclude ?? []);
   const clients = STREAM_CLIENTS.filter((c) => !excluded.has(c));
