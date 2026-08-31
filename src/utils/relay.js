@@ -61,6 +61,11 @@ export async function relaySearch(query, limit = 5) {
       signal: AbortSignal.timeout(10_000),
     });
 
+    if (pRes.status === 429) {
+      console.log(`[relay] search rate limited (429) for "${query.substring(0, 40)}"`);
+      return null;
+    }
+
     if (pRes.ok) {
       const html = await pRes.text();
       const results = parseYouTubeSearchHTML(html);
@@ -92,6 +97,11 @@ export async function relayVideoInfo(videoId) {
       signal: AbortSignal.timeout(8_000),
     });
 
+    if (pRes.status === 429) {
+      console.log(`[relay] video-info rate limited (429) for ${videoId}`);
+      return null;
+    }
+
     if (pRes.ok) {
       const html = await pRes.text();
       const title = parseYouTubeTitle(html);
@@ -114,6 +124,10 @@ export async function relayVideoInfo(videoId) {
  * Get a proxied audio stream URL from the relay.
  * Uses the generic proxy pattern with x-relay-target header.
  * Forwards Innertube player API POST requests through the relay.
+ *
+ * Note: Cloudflare/Vercel IPs are often blocked by YouTube for audio streaming.
+ * When the relay returns no formats or UNPLAYABLE, this returns null to trigger
+ * fallback to direct youtubei.js requests.
  */
 export async function relayAudioStream(videoId) {
   if (!ENABLED) return null;
@@ -150,11 +164,19 @@ export async function relayAudioStream(videoId) {
     }
 
     const data = await pRes.json();
+    const playability = data?.playabilityStatus?.status;
+
+    if (playability && playability !== 'OK') {
+      const reason = data?.playabilityStatus?.reason || 'unknown';
+      console.log(`[relay] stream ${playability} for ${videoId}: ${reason.substring(0, 100)}`);
+      return null;
+    }
+
     const formats = data?.streamingData?.adaptiveFormats || [];
     const audioFormats = formats.filter((f) => f.audioQuality && f.url);
 
     if (audioFormats.length === 0) {
-      console.warn(`[relay] no audio formats in response for ${videoId}`);
+      console.log(`[relay] no audio formats for ${videoId} via ${RELAY_TYPE}`);
       return null;
     }
 
